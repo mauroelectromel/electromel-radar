@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#04080f">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>ELECTROMEL · RADAR TÁCTICO v6</title>
+
+<!-- PWA Manifest -->
+<link rel="manifest" href="./manifest.json">
+
+<!-- Fuentes — preconnect para reducir latencia en primera carga -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&family=Barlow:wght@400;500;600;700;800;900&family=Barlow+Condensed:wght@600;700;800;900&display=swap" rel="stylesheet">
+
+<!-- Leaflet CSS — versión fija para cache predecible -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+<!-- App CSS -->
+<link rel="stylesheet" href="./radar.css">
+
+<!-- =====================================================================
+     RADARDB — Motor de persistencia
+     Debe ejecutarse en <head>, ANTES que app.js, porque app.js
+     hace `const DB = window.RadarDB` al cargar.
+     Es el único script que permanece inline por esta razón de orden.
+     ===================================================================== -->
+<script>
+(function(global) {
+  'use strict';
+
+  const IDB_NAME    = 'ElectromelRadarDB';
+  const IDB_VERSION = 1;
+
+  let _db   = null;
+  let _mode = null;
+
+  function _openDB() {
+    return new Promise((resolve, reject) => {
+      if (!global.indexedDB) { reject(new Error('IndexedDB no soportado')); return; }
+      const req = global.indexedDB.open(IDB_NAME, IDB_VERSION);
+
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains('leads'))
+          db.createObjectStore('leads', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('config'))
+          db.createObjectStore('config', { keyPath: 'key' });
+        if (!db.objectStoreNames.contains('backups'))
+          db.createObjectStore('backups', { keyPath: 'id', autoIncrement: true });
+      };
+
+      req.onsuccess = (e) => resolve(e.target.result);
+      req.onerror   = (e) => reject(e.target.error);
+      req.onblocked = ()  => reject(new Error('IndexedDB bloqueada'));
+    });
+  }
+
+  function _tx(store, mode, fn) {
+    return new Promise((resolve, reject) => {
+      try {
+        const tx  = _db.transaction(store, mode);
+        const st  = tx.objectStore(store);
+        const req = fn(st);
+        if (req && req.onsuccess !== undefined) {
+          req.onsuccess = (e) => resolve(e.target.result);
+          req.onerror   = (e) => reject(e.target.error);
+        } else {
+          tx.oncomplete = () => resolve(req);
+          tx.onerror    = (e) => reject(e.target.error);
+        }
+      } catch(err) { reject(err); }
+    });
+  }
+
+  function _getAll(store) {
+    return new Promise((resolve, reject) => {
+      try {
+        const tx  = _db.transaction(store, 'readonly');
+        const st  = tx.objectStore(store);
+        const req = st.getAll();
+        req.onsuccess = (e) => resolve(e.target.result);
+        req.onerror   = (e) => reject(e.target.error);
+      } catch(err) { reject(err); }
+    });
+  }
+
+  function _getAllSorted(store, field, desc=false, limit=999) {
+    return new Promise((resolve, reject) => {
+      try {
+        const tx      = _db.transaction(store, 'readonly');
+        const st      = tx.objectStore(store);
+        const results = [];
+        const req     = st.openCursor();
+        req.onsuccess = (e) => {
+          const cursor = e.target.result;
+          if (cursor) { results.push(cursor.value); cursor.continue(); }
+          else {
+            results.sort((a,b) => {
+              const av = a[field]||'', bv = b[field]||'';
+              return desc ? (bv>av?1:bv<av?-1:0) : (av>bv?1:av<bv?-1:0);
+            });
+            resolve(results.slice(0, limit));
+          }
+        };
+        req.onerror = (e) => reject(e.target.error);
+      } catch(err) { reject(err); }
+    });
+  }
+
+  function _put(store, obj)  { return _tx(store, 'readwrite', st => st.put(obj)); }
+  function _get(store, key)  { return _tx(store, 'readonly',  st => st.get(key)); }
+  function _del(store, key)  { return _tx(store, 'readwrite', st => st.delete(key)); }
+  function _clear(store)     { return _tx(store, 'readwrite', st => st.clear()); }
+
+  function _bulkPut(store, items) {
+    return new Promise((resolve, reject) => {
+      if (!items.length) { resolve(); return; }
+      try {
+        const tx = _db.transaction(store, 'readwrite');
+        const st = tx.objectStore(store);
+        items.forEach(item => st.put(item));
+        tx.oncomplete = () => resolve();
+        tx.onerror    = (e) => reject(e.target.error);
+      } catch(err) { reject(err); }
+    });
+  }
+
+  const LS_PREFIX = 'em6_';
+  const LS = {
+    get: (k, d=null) => {
+      try {
+        const v = localStorage.getItem(LS_PREFIX+k);
+        return v !== null ? JSON.parse(v) : d;
+      } catch { return d; }
+    },
+    set: (k, v) => {
+      try {
+        localStorage.setItem(LS_PREFIX+k, JSON.stringify(v));
+        return true;
+      } catch(e) {
+        try {
+          localStorage.removeItem(LS_PREFIX+'backups');
+          localStorage.setItem(LS_PREFIX+k, JSON.stringify(v));
+          return true;
+        } catch { console.error('[RadarDB] localStorage lleno:', e); return false; }
+      }
+    },
+    del: (k) => { try { localStorage.removeItem(LS_PREFIX+k); } catch {} }
+  };
+
+  const DB = {
+    mode: () => _mode,
+
+    async init() {
+      try {
+        _db   = await _openDB();
+        _mode = 'idb';
+        console.log('✓ RadarDB: IndexedDB activo');
+      } catch(e) {
+        _db   = null;
+        _mode = 'ls';
+        console.warn('✗ RadarDB: usando localStorage.', e.message);
+      }
+      return _mode;
+    },
+
+    async setConfig(key, value) {
+      try {
+        if (_mode==='idb') await _put('config', { key, value });
+        else LS.set('cfg_'+key, value);
+      } catch(e) { console.error('[RadarDB] setConfig:', e); }
+    },
+
+    async getConfig(key, def=null) {
+      try {
+        if (_mode==='idb') {
+          const r = await _get('config', key);
+          return r ? r.value : def;
+        }
+        const v = LS.get('cfg_'+key, null);
+        return v !== null ? v : def;
+      } catch { return def; }
+    },
+
+    async saveLead(lead) {
+      if (!lead.id) throw new Error('Lead sin id');
+      try {
+        if (_mode==='idb') await _put('leads', lead);
+        else {
+          const all = LS.get('leads', []);
+          const i   = all.findIndex(l => l.id === lead.id);
+          if (i >= 0) all[i] = lead; else all.push(lead);
+          LS.set('leads', all);
+        }
+      } catch(e) { console.error('[RadarDB] saveLead:', e); throw e; }
+    },
+
+    async saveLeads(leads) {
+      try {
+        if (_mode==='idb') await _bulkPut('leads', leads);
+        else LS.set('leads', leads);
+      } catch(e) { console.error('[RadarDB] saveLeads:', e); throw e; }
+    },
+
+    async deleteLead(id) {
+      try {
+        if (_mode==='idb') await _del('leads', id);
+        else LS.set('leads', LS.get('leads',[]).filter(l => l.id !== id));
+      } catch(e) { console.error('[RadarDB] deleteLead:', e); }
+    },
+
+    async loadLeads() {
+      try {
+        if (_mode==='idb') return await _getAll('leads');
+        return LS.get('leads', []);
+      } catch(e) {
+        console.error('[RadarDB] loadLeads:', e);
+        const snap = LS.get('last_leads_snap', null);
+        if (snap) { console.warn('[RadarDB] Recuperando desde snapshot LS'); return snap; }
+        return [];
+      }
+    },
+
+    async clearLeads() {
+      try {
+        if (_mode==='idb') await _clear('leads');
+        else LS.del('leads');
+      } catch(e) { console.error('[RadarDB] clearLeads:', e); }
+    },
+
+    async saveBackup(backup) {
+      try {
+        if (_mode==='idb') {
+          delete backup.id;
+          await _put('backups', backup);
+          const all   = await _getAllSorted('backups', 'fecha', true, 999);
+          const autos = all.filter(b => b.tipo==='auto');
+          if (autos.length > 7) {
+            for (const b of autos.slice(7)) if (b.id) await _del('backups', b.id);
+          }
+        }
+        if (backup.tipo === 'auto') {
+          const snap = LS.get('backups_ls', []);
+          backup.id  = backup.id || Date.now();
+          snap.unshift(backup);
+          LS.set('backups_ls', snap.slice(0, 3));
+        }
+      } catch(e) { console.error('[RadarDB] saveBackup:', e); }
+    },
+
+    async loadBackups(limit=5) {
+      try {
+        if (_mode==='idb') return await _getAllSorted('backups', 'fecha', true, limit);
+        return LS.get('backups_ls', []).slice(0, limit);
+      } catch { return LS.get('backups_ls', []).slice(0, limit); }
+    },
+
+    async getBackupById(id) {
+      try {
+        if (_mode==='idb') return await _get('backups', +id);
+        return LS.get('backups_ls', []).find(b => b.id==id) || null;
+      } catch { return null; }
+    },
+
+    snapshotLeads(leads) {
+      try { LS.set('last_leads_snap', leads); } catch {}
+    }
+  };
+
+  global.RadarDB = DB;
+  console.log('✓ RadarDB motor cargado');
+
+})(window);
+</script>
+</head>
+
+<body>
+
+<!-- =====================================================================
+     OFFLINE BANNER
+     ===================================================================== -->
+<div id="offline-banner">⚡ SIN CONEXIÓN · MODO OFFLINE ACTIVO</div>
+
+<!-- =====================================================================
+     MAPA
+     ===================================================================== -->
+<div id="map-container">
+  <div id="map"></div>
+</div>
+
+<!-- LONG PRESS INDICATOR -->
+<div id="longpress-indicator"></div>
+
+<!-- DB LOADING SPLASH -->
+<div id="db-status">
+  <div class="spinner"></div>
+  <div style="font-family:var(--mono);font-size:12px;color:var(--text-dim);">
+    INICIANDO BASE DE DATOS...
+  </div>
+</div>
+
+<!-- =====================================================================
+     TOP BAR
+     ===================================================================== -->
+<div id="top-bar">
+  <div class="top-row">
+    <div id="app-title">
+      <div class="app-title-brand">ELECTROMEL</div>
+      <div class="app-title-name">RADAR v6</div>
+    </div>
+    <div id="search-bar">
+      <input id="inp-busqueda-rapida"
+             type="text"
+             placeholder="Buscar ciudad o negocio..."
+             autocomplete="off">
+      <button class="map-btn" id="btn-toggle-leads-map" title="Mostrar/ocultar leads">📍</button>
+    </div>
+  </div>
+
+  <div id="mode-tabs">
+    <button class="mode-tab active" data-tab="terreno">TERRENO</button>
+    <button class="mode-tab"        data-tab="buscar">BUSCAR</button>
+    <button class="mode-tab"        data-tab="leads">LEADS</button>
+    <button class="mode-tab"        data-tab="seguimientos">HOY</button>
+    <button class="mode-tab"        data-tab="ruta">RUTA</button>
+    <button class="mode-tab"        data-tab="zonas">ZONAS</button>
+    <button class="mode-tab"        data-tab="stats">STATS</button>
+    <button class="mode-tab"        data-tab="config">CONFIG</button>
+  </div>
+</div>
+
+<!-- =====================================================================
+     FABs
+     ===================================================================== -->
+<button id="fab-gps" title="GPS">📡</button>
+<button id="fab-add" title="Captura rápida">+</button>
+
+<!-- =====================================================================
+     BOTTOM PANEL
+     ===================================================================== -->
+<div id="bottom-panel">
+
+  <!-- Handle y tabs del panel -->
+  <div id="panel-handle">
+    <div class="handle-bar"></div>
+    <div id="panel-tabs">
+      <button class="panel-tab active" data-tab="terreno">TERRENO</button>
+      <button class="panel-tab"        data-tab="buscar">BUSCAR</button>
+      <button class="panel-tab"        data-tab="leads">LEADS</button>
+      <button class="panel-tab"        data-tab="seguimientos">HOY</button>
+      <button class="panel-tab"        data-tab="ruta">RUTA</button>
+      <button class="panel-tab"        data-tab="zonas">ZONAS</button>
+      <button class="panel-tab"        data-tab="stats">STATS</button>
+      <button class="panel-tab em-tab" data-tab="config">CFG</button>
+    </div>
+  </div>
+
+  <!-- Contenido scrolleable -->
+  <div id="panel-content">
+
+    <!-- ======= TERRENO ======= -->
+    <div id="sec-terreno" class="panel-sec">
+      <div class="sec-header">
+        <div class="sec-title">DETECCIÓN TÉCNICA ACTIVA</div>
+        <button id="btn-ir-hoy" class="btn btn-em btn-sm">RUTA HOY</button>
+      </div>
+      <div id="terreno-status"
+           class="muted"
+           style="margin-bottom:8px;text-align:center;font-family:var(--mono);font-size:11px;">
+        Activá GPS para detectar oportunidades técnicas
+      </div>
+      <div id="lista-terreno"></div>
+    </div>
+
+    <!-- ======= BUSCAR ======= -->
+    <div id="sec-buscar" class="panel-sec sec-form" style="display:none;">
+      <div class="field">
+        <label>Ciudad / Zona</label>
+        <div class="autocomplete-wrap">
+          <input id="inp-ciudad"
+                 type="text"
+                 placeholder="Ej: Neuquén, Bariloche, Roca..."
+                 autocomplete="off">
+          <div class="autocomplete-list" id="ciudad-suggest"></div>
+        </div>
+      </div>
+
+      <div class="toggle-row" id="toggle-zona">
+        <div class="toggle-label">
+          Buscar en toda la zona
+          <small>Recorre todas las ciudades del corredor</small>
+        </div>
+        <div class="toggle-switch"></div>
+      </div>
+
+      <div class="field">
+        <label>Tipo de negocio / equipo</label>
+        <input id="inp-rubro"
+               type="text"
+               placeholder="gym, hotel, metalurgica, soldadora, taller..."
+               autocomplete="off">
+      </div>
+
+      <div class="field">
+        <label>Fuente de datos</label>
+        <select id="inp-fuente">
+          <option value="osm">OpenStreetMap (gratis, offline-ready)</option>
+          <option value="google">Google Places (requiere API Key)</option>
+        </select>
+      </div>
+
+      <button class="btn btn-g btn-block" id="btn-buscar">BUSCAR OBJETIVOS</button>
+      <div id="buscar-info"
+           class="muted"
+           style="margin-top:8px;text-align:center;font-family:var(--mono);font-size:11px;"></div>
+      <hr>
+      <div id="resultados-buscar"></div>
+    </div>
+
+    <!-- ======= LEADS ======= -->
+    <div id="sec-leads" class="panel-sec" style="display:none;">
+      <div class="filtros" id="filtros-leads">
+        <button class="filtro-btn active" data-filtro="todos">TODOS</button>
+        <button class="filtro-btn em"     data-filtro="urgente">URGENTE</button>
+        <button class="filtro-btn"        data-filtro="alta">ALTA</button>
+        <button class="filtro-btn"        data-filtro="media">MEDIA</button>
+        <button class="filtro-btn"        data-filtro="baja">BAJA</button>
+        <button class="filtro-btn"        data-filtro="no-contactado">SIN CONTACTO</button>
+        <button class="filtro-btn"        data-filtro="contactado">CONTACTADO</button>
+        <button class="filtro-btn"        data-filtro="cliente">CLIENTE</button>
+        <button class="filtro-btn"        data-filtro="recurrente">RECURRENTE</button>
+        <button class="filtro-btn"        data-filtro="mantenimiento">MANTENIMIENTO</button>
+      </div>
+      <input id="inp-buscar-leads"
+             type="text"
+             placeholder="Filtrar leads..."
+             style="margin-bottom:10px;"
+             autocomplete="off">
+      <div id="lista-leads"></div>
+    </div>
+
+    <!-- ======= HOY (SEGUIMIENTOS) ======= -->
+    <div id="sec-seguimientos" class="panel-sec" style="display:none;">
+      <div class="sec-header">
+        <div class="sec-title">SEGUIMIENTOS HOY</div>
+        <span id="badge-seguimientos"
+              style="background:var(--red);color:white;font-family:var(--mono);font-size:11px;font-weight:700;padding:2px 8px;border-radius:8px;display:none;"></span>
+      </div>
+      <div id="lista-seguimientos"></div>
+    </div>
+
+    <!-- ======= RUTA ======= -->
+    <div id="sec-ruta" class="panel-sec" style="display:none;">
+      <div class="sec-header">
+        <div class="sec-title">PLANIFICADOR DE RUTA</div>
+      </div>
+      <div class="info-banner em">
+        Orden optimizado por cercanía. Abrí en Maps con todas las paradas.
+      </div>
+      <div class="field">
+        <label>Agregar parada manual</label>
+        <input id="inp-ruta-manual"
+               type="text"
+               placeholder="Ej: Av. Colón 1234, Neuquén"
+               autocomplete="off">
+      </div>
+      <button class="btn btn-block" id="btn-add-manual-ruta">+ AGREGAR PARADA</button>
+      <hr>
+      <div id="lista-ruta"></div>
+      <div class="row-2" style="margin-top:10px;">
+        <button class="btn btn-r btn-sm" id="btn-clear-ruta">LIMPIAR</button>
+        <button class="btn btn-em"       id="btn-iniciar-ruta">INICIAR RECORRIDO</button>
+      </div>
+    </div>
+
+    <!-- ======= ZONAS ======= -->
+    <div id="sec-zonas" class="panel-sec" style="display:none;">
+      <div class="sec-header">
+        <div class="sec-title em">MAPA CALOR INDUSTRIAL</div>
+      </div>
+      <div class="info-banner em">
+        Score = (clientes×3)+(respondieron×2)+contactados. Zonas industriales priorizadas.
+      </div>
+      <div class="field">
+        <label>Agrupación</label>
+        <select id="zona-modo">
+          <option value="auto">Por cercanía (radio)</option>
+          <option value="barrio">Por zona / barrio</option>
+        </select>
+      </div>
+      <div class="field" id="zona-radio-wrap">
+        <label>Radio: <b id="zona-radio-val">800</b> m</label>
+        <input id="zona-radio"
+               type="range"
+               min="200" max="3000" step="100" value="800"
+               style="padding:0;background:transparent;border:none;">
+      </div>
+      <button class="btn btn-block" id="btn-recalc-zonas" style="margin-bottom:10px;">
+        RECALCULAR ZONAS
+      </button>
+      <div id="lista-zonas"></div>
+      <div id="detalle-zona" style="display:none;"></div>
+    </div>
+
+    <!-- ======= STATS ======= -->
+    <div id="sec-stats" class="panel-sec" style="display:none;">
+      <div class="sec-header">
+        <div class="sec-title">MÉTRICAS OPERATIVAS</div>
+      </div>
+      <div class="stats-grid" id="stats-grid"></div>
+      <hr>
+      <div style="font-size:13px;font-weight:800;margin-bottom:8px;font-family:var(--cond);letter-spacing:0.5px;">
+        EQUIPOS MÁS DETECTADOS
+      </div>
+      <div id="stats-equipos" style="margin-bottom:14px;"></div>
+      <hr>
+      <div style="font-size:13px;font-weight:800;margin-bottom:8px;font-family:var(--cond);letter-spacing:0.5px;">
+        BACKUPS Y DATOS
+      </div>
+      <div class="row-2" style="margin-bottom:8px;">
+        <button class="btn btn-sm" id="btn-exportar">EXPORTAR JSON</button>
+        <button class="btn btn-sm" id="btn-importar">IMPORTAR JSON</button>
+      </div>
+      <div id="lista-backups" style="margin-bottom:8px;"></div>
+      <button class="btn btn-r btn-block btn-sm" id="btn-borrar-todo">BORRAR TODO</button>
+      <input type="file" id="file-import" accept=".json" style="display:none;">
+    </div>
+
+    <!-- ======= CONFIG ======= -->
+    <div id="sec-config" class="panel-sec" style="display:none;">
+      <div class="sec-header">
+        <div class="sec-title">CONFIGURACIÓN</div>
+      </div>
+      <div class="field">
+        <label>Google Places API Key (opcional)</label>
+        <input id="inp-google-key"
+               type="text"
+               placeholder="Pegá tu API Key aquí"
+               autocomplete="off">
+        <p class="muted" style="margin-top:4px;">
+          Sin key usa OSM gratis. Con key obtenés teléfonos y datos extra.
+        </p>
+      </div>
+      <button class="btn btn-g btn-block" id="btn-save-key" style="margin-bottom:12px;">
+        GUARDAR API KEY
+      </button>
+      <hr>
+      <div style="font-size:13px;font-weight:800;margin-bottom:8px;font-family:var(--cond);letter-spacing:0.5px;">
+        PLANTILLAS WHATSAPP
+      </div>
+      <div class="info-banner">
+        Usá <b>{nombre}</b> — se reemplaza automáticamente.
+      </div>
+      <div class="field">
+        <label>Rubro</label>
+        <select id="inp-edit-rubro">
+          <option value="gimnasio">Gimnasios / Fitness</option>
+          <option value="hotel">Hoteles / Alojamiento</option>
+          <option value="constructora">Constructoras / Obras</option>
+          <option value="industrial">Industrial / Taller / Metalúrgica</option>
+          <option value="comercio">Comercio General</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Primer contacto</label>
+        <textarea id="msg-primero"></textarea>
+      </div>
+      <div class="field">
+        <label>Seguimiento técnico</label>
+        <textarea id="msg-seguimiento"></textarea>
+      </div>
+      <div class="field">
+        <label>Cierre / Propuesta</label>
+        <textarea id="msg-cierre"></textarea>
+      </div>
+      <button class="btn btn-g btn-block" id="btn-save-msg">GUARDAR PLANTILLAS</button>
+      <button class="btn btn-block"       id="btn-reset-msg" style="margin-top:6px;">
+        RESTAURAR POR DEFECTO
+      </button>
+    </div>
+
+  </div><!-- /panel-content -->
+</div><!-- /bottom-panel -->
+
+<!-- =====================================================================
+     MODAL: DETALLE / EDICIÓN LEAD
+     ===================================================================== -->
+<div class="modal-overlay" id="modal-lead">
+  <div class="modal">
+    <div class="modal-title"    id="modal-titulo">Lead</div>
+    <div class="modal-subtitle" id="modal-subtitle"></div>
+    <div id="modal-contenido"></div>
+    <button class="btn btn-block" id="btn-cerrar-modal" style="margin-top:12px;">CERRAR</button>
+  </div>
+</div>
+
+<!-- =====================================================================
+     MODAL: CAPTURA RÁPIDA
+     ===================================================================== -->
+<div class="quick-capture-overlay" id="modal-captura">
+  <div class="quick-capture">
+    <div class="qc-title">+ CAPTURA TÁCTICA</div>
+    <div id="captura-form"></div>
+  </div>
+</div>
+
+<!-- TOAST -->
+<div id="toast"></div>
+
+<!-- =====================================================================
+     Leaflet JS — antes de app.js porque app.js llama L.map() en init()
+     ===================================================================== -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<!-- =====================================================================
+     APP — lógica principal
+     defer: no bloquea el render del HTML, ejecuta después de parsear.
+     ===================================================================== -->
+<script src="./app.js" defer></script>
+
+</body>
+</html>
