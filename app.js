@@ -1527,60 +1527,286 @@ function cargarGoogleMapsAPI(key) {
   });
 }
 
+/* ======================================================================
+   GOOGLE PLACES — SISTEMA COMPLETO CON TELÉFONOS
+
+   DIAGNÓSTICO DEL BUG:
+   textSearch() y nearbySearch() NO devuelven formatted_phone_number.
+   Solo devuelven: name, geometry, place_id, formatted_address, rating,
+   types, photos, opening_hours, price_level, icon.
+   Los teléfonos SOLO existen en Place Details (getDetails).
+
+   FLUJO CORRECTO:
+   1. textSearch() → lista de place_id (rápido, sin teléfonos)
+   2. getDetails(place_id) con fields específicos → teléfono, web
+   3. Actualización progresiva de las cards (no esperar todo)
+   4. Cache en memoria + IndexedDB para no repetir requests
+
+   ESTRATEGIA MOBILE:
+   - Mostrar resultados inmediatamente sin esperar teléfonos
+   - Enriquecer con teléfonos de a 3 en paralelo (no todos juntos)
+   - 300ms entre lotes para no saturar la API ni el CPU
+   - Cache en memoria por sesión + persistencia en IDB
+   ====================================================================== */
+
+/* Cache de detalles: googleId → { telefono, web, ts } */
+const _detailsCache = new Map();
+const DETAILS_CACHE_TTL = 7 * 24 * 60 * 60 * 1000; /* 7 días en ms */
+
+/* Clave IDB para cache de detalles */
+const DETAILS_IDB_KEY = 'google_details_cache';
+
+/* Cargar cache desde IDB al iniciar */
+async function cargarDetallesCache() {
+  try {
+    const raw = await dbGetConfig(DETAILS_IDB_KEY, null);
+    if (!raw) return;
+    const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const ahora = Date.now();
+    let cargados = 0;
+    for (const [id, entry] of Object.entries(data)) {
+      /* Descartar entradas vencidas */
+      if (ahora - (entry.ts || 0) < DETAILS_CACHE_TTL) {
+        _detailsCache.set(id, entry);
+        cargados++;
+      }
+    }
+    if (cargados) console.log(`[Details] Cache cargado: ${cargados} entradas`);
+  } catch(e) {
+    console.warn('[Details] No se pudo cargar cache:', e.message);
+  }
+}
+
+/* Persistir cache en IDB (debounceado — no en cada request) */
+let _saveCacheTid = null;
+function persistirDetallesCache() {
+  clearTimeout(_saveCacheTid);
+  _saveCacheTid = setTimeout(async () => {
+    try {
+      const obj = {};
+      _detailsCache.forEach((v, k) => { obj[k] = v; });
+      await dbSetConfig(DETAILS_IDB_KEY, JSON.stringify(obj));
+    } catch(e) {
+      console.warn('[Details] No se pudo persistir cache:', e.message);
+    }
+  }, 2000);
+}
+
+/* ── getDetails para UN place_id ──────────────────────────────────── */
+function getPlaceDetails(service, placeId) {
+  return new Promise((resolve) => {
+    service.getDetails(
+      {
+        placeId: placeId,
+        fields: [
+          'formatted_phone_number',
+          'international_phone_number',
+          'website',
+          'opening_hours'
+        ]
+      },
+      (result, status) => {
+        const OK = google.maps.places.PlacesServiceStatus.OK;
+        if (status === OK && result) {
+          resolve({
+            telefono: result.international_phone_number
+                   || result.formatted_phone_number
+                   || '',
+            web:      result.website || '',
+            ts:       Date.now()
+          });
+        } else {
+          /* No rechazar — simplemente no hay detalle disponible */
+          resolve({ telefono: '', web: '', ts: Date.now() });
+        }
+      }
+    );
+  });
+}
+
+/* ── Cola de enriquecimiento progresivo ───────────────────────────── */
+/*
+   Procesa los place_ids de a LOTE_SIZE en paralelo.
+   Entre lotes espera DELAY_MS para no congelar Android ni saturar API.
+   Actualiza la card en el DOM en cuanto llega el teléfono.
+   No hace re-render completo — solo actualiza el elemento puntual.
+*/
+const LOTE_SIZE = 3;   /* requests paralelas por lote */
+const DELAY_MS  = 350; /* ms entre lotes */
+
+async function enriquecerConTelefonos(resultados, service) {
+  /* Solo los que tienen googleId y no están en cache */
+  const pendientes = resultados.filter(r =>
+    r.googleId && !_detailsCache.has(r.googleId)
+  );
+
+  if (!pendientes.length) {
+    /* Aplicar cache existente a los resultados sin fetch */
+    resultados.forEach(r => {
+      if (r.googleId && _detailsCache.has(r.googleId)) {
+        const cached = _detailsCache.get(r.googleId);
+        r.telefono = cached.telefono;
+        r.web      = cached.web;
+        actualizarCardTelefono(r);
+      }
+    });
+    return;
+  }
+
+  /* Aplicar cache inmediatamente a los que ya lo tienen */
+  resultados.forEach(r => {
+    if (r.googleId && _detailsCache.has(r.googleId)) {
+      const cached = _detailsCache.get(r.googleId);
+      r.telefono = cached.telefono;
+      r.web      = cached.web;
+      actualizarCardTelefono(r);
+    }
+  });
+
+  /* Procesar pendientes en lotes */
+  for (let i = 0; i < pendientes.length; i += LOTE_SIZE) {
+    const lote = pendientes.slice(i, i + LOTE_SIZE);
+
+    await Promise.all(lote.map(async r => {
+      try {
+        const detail = await getPlaceDetails(service, r.googleId);
+        /* Guardar en cache */
+        _detailsCache.set(r.googleId, detail);
+        /* Actualizar el objeto resultado en memoria */
+        r.telefono = detail.telefono;
+        r.web      = detail.web;
+        /* Actualizar la card en el DOM sin re-render */
+        actualizarCardTelefono(r);
+      } catch(e) {
+        console.warn('[Details] Error en', r.nombre, e.message);
+      }
+    }));
+
+    /* Pausa entre lotes — excepto después del último */
+    if (i + LOTE_SIZE < pendientes.length) {
+      await new Promise(res => setTimeout(res, DELAY_MS));
+    }
+  }
+
+  /* Persistir cache actualizado */
+  persistirDetallesCache();
+}
+
+/* ── Actualizar UNA card en el DOM cuando llega el teléfono ──────── */
+/*
+   Identifica la card por data-google-id y actualiza solo
+   el bloque del teléfono — sin tocar el resto del DOM.
+   Si la card ya no existe (el usuario scrolleó y la destruyó), silencio.
+*/
+function actualizarCardTelefono(resultado) {
+  if (!resultado.googleId) return;
+  const card = document.querySelector(
+    `[data-google-id="${CSS.escape(resultado.googleId)}"]`
+  );
+  if (!card) return;
+
+  const telEl = card.querySelector('.rc-tel-slot');
+  if (!telEl) return;
+
+  const tel = resultado.telefono && limpiarTel(resultado.telefono).length >= 6;
+
+  if (tel) {
+    telEl.innerHTML = `📞 <strong>${esc(resultado.telefono)}</strong>`;
+    telEl.classList.remove('muted');
+    /* Activar botón WA si no estaba */
+    const actionsEl = card.querySelector('.rc-actions');
+    if (actionsEl && !card.querySelector('.rc-wa-btn')) {
+      const idx = resultado._idx;
+      const waBtn = document.createElement('button');
+      waBtn.className   = 'btn btn-sm btn-b rc-wa-btn';
+      waBtn.textContent = 'WA';
+      waBtn.addEventListener('click', async () => {
+        let lead = encontrarLeadExistente(resultado);
+        if (!lead) {
+          lead = crearLeadDesdeResultado(resultado);
+          await dbSaveLead(lead);
+        }
+        abrirWhatsApp(lead, 'primero');
+      });
+      /* Insertar antes del botón GUARDAR */
+      const guardarBtn = actionsEl.querySelector('[data-rc-add]');
+      actionsEl.insertBefore(waBtn, guardarBtn);
+    }
+  } else {
+    telEl.innerHTML = '<span class="muted">Sin teléfono</span>';
+  }
+}
+
+/* ── Helper para crear lead desde resultado (evita duplicación) ───── */
+function crearLeadDesdeResultado(n) {
+  const lead = {
+    id: uid(), nombre: n.nombre, direccion: n.direccion || '',
+    telefono: n.telefono || '', web: n.web || '',
+    lat: n.lat || null, lon: n.lon || null, tipo: n.tipo || '',
+    rubro: n.rubro || 'comercio', fuente: n.fuente || 'google',
+    osmId: n.osmId || null, googleId: n.googleId || null,
+    rating: n.rating || 0, prioridad: 'media', estado: 'no-contactado',
+    notas: '', equipos: [], tags: [], fotos: [], nivel: 'bajo',
+    intentosContacto: 0, cicloMantenimiento: null, proximaRevision: null,
+    creado: new Date().toISOString(), historial: []
+  };
+  lead.prioridad = calcularPrioridad(lead);
+  return lead;
+}
+
+/* ── PlacesService compartido (creado una sola vez por sesión) ────── */
+let _placesService = null;
+function getPlacesService() {
+  if (!_placesService) {
+    const div = document.createElement('div');
+    _placesService = new google.maps.places.PlacesService(div);
+  }
+  return _placesService;
+}
+
+/* ── buscarGoogle principal ───────────────────────────────────────── */
 async function buscarGoogle(ciudad, rubro) {
   if (!state.gkey) {
     throw new Error(
-      'Configurá tu API Key en la pestaña CONFIG. ' +
-      'Necesitás habilitar "Maps JavaScript API" y "Places API" en Google Cloud Console.'
+      'Configurá tu API Key en CONFIG. ' +
+      'Necesitás habilitar "Maps JavaScript API" y "Places API".'
     );
   }
 
-  /* Cargar la Maps JS API si no está cargada todavía */
-  try {
-    await cargarGoogleMapsAPI(state.gkey);
-  } catch(e) {
-    throw new Error(e.message);
-  }
+  try { await cargarGoogleMapsAPI(state.gkey); } catch(e) { throw e; }
 
-  /* Geocodificar la ciudad con Google para obtener coordenadas */
-  const geocoder = new google.maps.Geocoder();
+  /* Geocodificar */
+  const geocoder  = new google.maps.Geocoder();
   const geoResult = await new Promise((resolve, reject) => {
-    geocoder.geocode({ address: ciudad + ', Argentina' }, (results, status) => {
-      if (status === 'OK' && results.length) resolve(results[0]);
-      else reject(new Error(`Google no encontró la ciudad "${ciudad}" (${status})`));
-    });
+    geocoder.geocode(
+      { address: ciudad + ', Argentina' },
+      (results, status) => {
+        if (status === 'OK' && results.length) resolve(results[0]);
+        else reject(new Error(`Google no encontró "${ciudad}" (${status})`));
+      }
+    );
   });
 
+  const service  = getPlacesService();
   const location = geoResult.geometry.location;
 
-  /* PlacesService requiere un elemento del DOM */
-  const tempDiv = document.createElement('div');
-  const service = new google.maps.places.PlacesService(tempDiv);
-
-  const request = {
-    query:    `${rubro} ${ciudad}`,
-    location: location,
-    radius:   15000
-  };
-
+  /* textSearch — devuelve lista base SIN teléfonos */
   const places = await new Promise((resolve, reject) => {
-    service.textSearch(request, (results, status) => {
-      if (status === google.maps.places.PlacesServiceStatus.OK ||
-          status === google.maps.places.PlacesServiceStatus.ZERO_RESULTS) {
-        resolve(results || []);
-      } else {
-        reject(new Error(
-          `Google Places devolvió: ${status}. ` +
-          `Verificá que tu Key tenga habilitada "Places API".`
-        ));
+    service.textSearch(
+      { query: `${rubro} ${ciudad}`, location, radius: 15000 },
+      (results, status) => {
+        const S = google.maps.places.PlacesServiceStatus;
+        if (status === S.OK || status === S.ZERO_RESULTS) resolve(results || []);
+        else reject(new Error(`Google Places: ${status}`));
       }
-    });
+    );
   });
 
-  return places.map(r => ({
+  /* Mapear resultados base — telefono vacío por ahora */
+  const resultados = places.map((r, i) => ({
     nombre:    r.name,
     direccion: r.formatted_address || '',
-    telefono:  '',
+    telefono:  '',    /* ← se llena en enriquecerConTelefonos() */
     web:       '',
     lat:       r.geometry?.location?.lat() ?? null,
     lon:       r.geometry?.location?.lng() ?? null,
@@ -1588,8 +1814,40 @@ async function buscarGoogle(ciudad, rubro) {
     rubro:     detectarRubro((r.types || [])[0] || ''),
     fuente:    'google',
     googleId:  r.place_id,
-    rating:    r.rating || 0
+    rating:    r.rating || 0,
+    _idx:      i       /* índice para referencia en actualizarCardTelefono */
   }));
+
+  /* Aplicar cache inmediato para los que ya tenemos detalles */
+  resultados.forEach(r => {
+    if (r.googleId && _detailsCache.has(r.googleId)) {
+      const c    = _detailsCache.get(r.googleId);
+      r.telefono = c.telefono;
+      r.web      = c.web;
+    }
+  });
+
+  return resultados;
+}
+
+/* ── Lanzar enriquecimiento DESPUÉS de renderizar ─────────────────── */
+/*
+   Se llama desde el handler de búsqueda, DESPUÉS de renderResultados(),
+   para que las cards ya estén en el DOM cuando llegan los teléfonos.
+*/
+async function lanzarEnriquecimiento(resultados) {
+  const conGoogleId = resultados.filter(r => r.fuente === 'google' && r.googleId);
+  if (!conGoogleId.length) return;
+
+  /* Esperar un tick para que el DOM esté pintado */
+  await new Promise(res => setTimeout(res, 100));
+
+  try {
+    const service = getPlacesService();
+    await enriquecerConTelefonos(conGoogleId, service);
+  } catch(e) {
+    console.warn('[Details] Enriquecimiento falló:', e.message);
+  }
 }
 
 /* ── Handler del botón BUSCAR ──────────────────────────────────────── */
@@ -1656,36 +1914,62 @@ $('#btn-buscar').addEventListener('click', async () => {
   renderResultados(resultados);
   if (resultados.length) renderMapResults(resultados);
 
+  /* Enriquecer con teléfonos DESPUÉS de que las cards estén en el DOM */
+  if (resultados.some(r => r.fuente === 'google')) {
+    lanzarEnriquecimiento(resultados);
+  }
+
   $('#btn-buscar').disabled = false;
 });
 
 function renderResultados(lista) {
   const cont = $('#resultados-buscar');
-  if (!lista.length) { cont.innerHTML = '<div class="empty-state"><span class="ico">🔍</span>Sin resultados.</div>'; return; }
+  if (!lista.length) {
+    cont.innerHTML = '<div class="empty-state"><span class="ico">🔍</span>Sin resultados.</div>';
+    return;
+  }
 
-  cont.innerHTML = lista.map((n,i) => {
+  cont.innerHTML = lista.map((n, i) => {
     const tel    = !!(n.telefono && limpiarTel(n.telefono).length >= 6);
     const yaLead = !!encontrarLeadExistente(n);
-    const src    = n.fuente==='google' ? 'g' : 'osm';
+    const src    = n.fuente === 'google' ? 'g' : 'osm';
     const iut    = n.iut || 0;
+    const gid    = n.googleId ? `data-google-id="${esc(n.googleId)}"` : '';
+
+    /* Slot de teléfono:
+       - Si ya tenemos el teléfono (cache hit) → mostrarlo
+       - Si es Google y no tenemos → spinner pequeño mientras llega
+       - Si es OSM sin teléfono → "Sin teléfono" */
+    let telHtml;
+    if (tel) {
+      telHtml = `<div class="rc-meta rc-tel-slot">📞 <strong>${esc(n.telefono)}</strong></div>`;
+    } else if (n.fuente === 'google' && n.googleId) {
+      telHtml = `<div class="rc-meta rc-tel-slot muted"><span class="spinner" style="width:10px;height:10px;border-width:1px;vertical-align:middle;margin-right:4px;"></span>Cargando teléfono...</div>`;
+    } else {
+      telHtml = `<div class="rc-meta rc-tel-slot muted">Sin teléfono detectado</div>`;
+    }
+
     return `
-    <div class="result-card src-${src}">
+    <div class="result-card src-${src}" ${gid}>
       <div class="rc-header">
         <div class="rc-name">${esc(n.nombre)} <span class="iut-badge ${iutClase(iut)}" style="font-size:9px;">${iutLabel(iut)}${iut}</span></div>
-        <div style="text-align:right;">${n.rating?`<div style="color:var(--yellow);font-size:11px;">★ ${n.rating}</div>`:''}</div>
+        <div style="text-align:right;">${n.rating ? `<div style="color:var(--yellow);font-size:11px;">★ ${n.rating}</div>` : ''}</div>
       </div>
       ${n.direccion ? `<div class="rc-meta">📍 ${esc(n.direccion)}</div>` : ''}
-      ${tel ? `<div class="rc-meta">📞 <strong>${esc(n.telefono)}</strong></div>` : '<div class="rc-meta muted">Sin teléfono detectado</div>'}
+      ${telHtml}
       ${n.tipo ? `<div class="rc-meta muted">${esc(n.tipo)}</div>` : ''}
       <div class="rc-actions">
         <button class="btn btn-sm" data-rc-maps="${i}">MAPS</button>
-        ${tel ? `<button class="btn btn-sm btn-b" data-rc-wa="${i}">WA</button>` : ''}
-        <button class="btn btn-sm ${yaLead?'':'btn-em'}" data-rc-add="${i}" ${yaLead?'disabled style="opacity:0.5;"':''}>
+        ${tel ? `<button class="btn btn-sm btn-b rc-wa-btn" data-rc-wa="${i}">WA</button>` : ''}
+        <button class="btn btn-sm ${yaLead ? '' : 'btn-em'}" data-rc-add="${i}" ${yaLead ? 'disabled style="opacity:0.5;"' : ''}>
           ${yaLead ? '✓ GUARDADO' : '+ GUARDAR'}
         </button>
       </div>
     </div>`;
   }).join('');
+
+  /* Guardar _idx en cada resultado para referencia posterior */
+  lista.forEach((n, i) => { n._idx = i; });
 
   cont.querySelectorAll('[data-rc-maps]').forEach(b =>
     b.addEventListener('click', () => abrirMaps(state.resultados[+b.dataset.rcMaps])));
@@ -1694,27 +1978,18 @@ function renderResultados(lista) {
     b.addEventListener('click', async () => {
       const n = state.resultados[+b.dataset.rcAdd];
       if (!n || encontrarLeadExistente(n)) return;
-      const lead = {
-        id:uid(), nombre:n.nombre, direccion:n.direccion||'', telefono:n.telefono||'',
-        web:n.web||'', lat:n.lat||null, lon:n.lon||null, tipo:n.tipo||'',
-        rubro:n.rubro||'comercio', fuente:n.fuente||'osm', osmId:n.osmId||null,
-        googleId:n.googleId||null, rating:n.rating||0,
-        prioridad:'media', estado:'no-contactado', notas:'',
-        equipos:[], tags:[], fotos:[], nivel:'bajo',
-        intentosContacto:0, cicloMantenimiento:null, proximaRevision:null,
-        creado:new Date().toISOString(), historial:[]
-      };
-      lead.prioridad = calcularPrioridad(lead);
+      const lead = crearLeadDesdeResultado(n);
       await dbSaveLead(lead);
-      /* Marker directo sin rebuild */
       if (lead.lat && lead.lon && state.mapLeadsVisible) {
-        const m = L.marker([lead.lat,lead.lon],{icon:createLeadIcon(lead)})
+        const m = L.marker([lead.lat, lead.lon], { icon: createLeadIcon(lead) })
           .addTo(map)
-          .on('click',()=>{expandPanel();setTab('leads');setTimeout(()=>abrirModalLead(lead.id),200);});
+          .on('click', () => { expandPanel(); setTab('leads'); setTimeout(() => abrirModalLead(lead.id), 200); });
         _leadMarkersMap.set(lead.id, m);
       }
-      b.textContent='✓ GUARDADO'; b.disabled=true; b.classList.remove('btn-em');
-      toast('✓ Lead guardado');
+      b.textContent = '✓ GUARDADO';
+      b.disabled = true;
+      b.classList.remove('btn-em');
+      toast('✓ Lead guardado con teléfono');
     });
   });
 
@@ -1723,14 +1998,7 @@ function renderResultados(lista) {
       const n = state.resultados[+b.dataset.rcWa];
       let lead = encontrarLeadExistente(n);
       if (!lead) {
-        lead = {
-          id:uid(), nombre:n.nombre, direccion:n.direccion||'', telefono:n.telefono||'',
-          web:n.web||'', lat:n.lat||null, lon:n.lon||null, tipo:n.tipo||'',
-          rubro:n.rubro||'comercio', fuente:n.fuente||'osm', osmId:n.osmId||null,
-          prioridad:'media', estado:'no-contactado', notas:'',
-          equipos:[], tags:[], fotos:[], nivel:'bajo',
-          intentosContacto:0, creado:new Date().toISOString(), historial:[]
-        };
+        lead = crearLeadDesdeResultado(n);
         await dbSaveLead(lead);
       }
       abrirWhatsApp(lead, 'primero');
@@ -2446,6 +2714,9 @@ async function init() {
     await dbLoadLeads();
     /* Invalidar cache IUT al cargar (datos pueden haber cambiado fuera) */
     state.leads.forEach(l => delete l._iut);
+
+    /* Cargar cache de detalles Google (teléfonos) */
+    await cargarDetallesCache();
 
     const rutaRaw = await dbGetConfig('ruta', null);
     try {
