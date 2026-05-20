@@ -1847,8 +1847,13 @@ async function buscarGoogle(ciudad, rubro) {
     );
   });
 
-  const service  = getPlacesService();
-  const location = geoResult.geometry.location;
+  /* Service DEDICADO para esta búsqueda — no compartido.
+   * getDetails() corre en paralelo en el service compartido y
+   * Google Places no permite requests concurrentes en el mismo service.
+   * Un service propio por búsqueda evita el conflicto. */
+  const searchDiv = document.createElement('div');
+  const service   = new google.maps.places.PlacesService(searchDiv);
+  const location  = geoResult.geometry.location;
 
   /*
    * Paginación con callback persistente.
@@ -2014,9 +2019,11 @@ $('#btn-buscar').addEventListener('click', async () => {
   renderResultados(resultados);
   if (resultados.length) renderMapResults(resultados);
 
-  /* Enriquecer con teléfonos DESPUÉS de que las cards estén en el DOM */
+  /* Enriquecer teléfonos DESPUÉS de renderizar.
+   * Se lanza con delay para no competir con getDetails durante la búsqueda.
+   * La paginación ya terminó en este punto (buscarGoogle es await completo). */
   if (resultados.some(r => r.fuente === 'google')) {
-    lanzarEnriquecimiento(resultados);
+    setTimeout(() => lanzarEnriquecimiento(resultados), 500);
   }
 
   $('#btn-buscar').disabled = false;
