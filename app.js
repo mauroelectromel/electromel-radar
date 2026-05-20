@@ -2029,6 +2029,277 @@ async function lanzarEnriquecimiento(resultados) {
   }
 }
 
+/* ======================================================================
+   SISTEMA DE PROSPECCIÓN INTELIGENTE — ZONAS SEMÁNTICAS + GRID
+   ======================================================================
+
+   ESTRATEGIA:
+   Google Places devuelve resultados diferentes según la query exacta.
+   "Gym Neuquén" ≠ "Gym Neuquén centro" ≠ "Gym Neuquén parque industrial"
+   Combinando ciudad + zonas semánticas multiplicamos los resultados
+   sin depender de paginación limitada.
+
+   FLUJO:
+   1. generarConsultas(ciudad, rubro) → lista de queries únicas
+   2. Cada query → buscarGoogle() con paginación real (hasta 60/query)
+   3. Deduplicar por googleId/place_id
+   4. Renderizar progresivamente
+   5. Enriquecer teléfonos en background
+   ====================================================================== */
+
+/* ── Zonas semánticas por defecto ─────────────────────────────────── */
+/*
+ * ZONAS POR TIPO DE RUBRO
+ *
+ * Zonas genéricas: funcionan para cualquier negocio.
+ * Zonas industriales: solo para rubros técnicos/industriales.
+ * La función generarConsultas() detecta el tipo y elige las correctas.
+ */
+const ZONAS_GENERICAS = [
+  '',           /* búsqueda base — siempre primera */
+  'centro',
+  'zona norte',
+  'zona sur',
+  'zona este',
+  'zona oeste',
+  'zona comercial',
+  'barrio centro',
+  'avenida principal'
+];
+
+const ZONAS_INDUSTRIALES = [
+  '',           /* búsqueda base */
+  'parque industrial',
+  'zona industrial',
+  'zona talleres',
+  'zona oeste',
+  'zona norte',
+  'ruta 22',
+  'corredor productivo',
+  'barrio industrial',
+  'área logística',
+  'polo industrial',
+  'zona sur'
+];
+
+/* Keywords que indican rubro industrial/técnico */
+const KEYWORDS_INDUSTRIALES = [
+  'metalurg', 'taller', 'soldad', 'tornería', 'torneria',
+  'herrería', 'herreria', 'industrial', 'industria', 'fabrica',
+  'fábrica', 'motor', 'variador', 'tablero', 'eléctric', 'electric',
+  'mecánic', 'mecanica', 'corralon', 'corralón', 'logística',
+  'logistica', 'depósito', 'deposito', 'galpón', 'galpon',
+  'construcc', 'pintura industrial', 'plástic', 'plastic',
+  'caucho', 'hidráulic', 'hidraulic', 'neumátic', 'neumatic',
+  'generador', 'compresor', 'bomba', 'refriger', 'frigorif'
+];
+
+function esRubroIndustrial(rubro) {
+  const r = normalizar(rubro);
+  return KEYWORDS_INDUSTRIALES.some(k => r.includes(normalizar(k)));
+}
+
+const ZONAS_DEFAULT = ZONAS_INDUSTRIALES; /* compatibilidad */
+
+/* Zonas extra configurables por el usuario (se persisten en IDB) */
+let _zonasExtra = [];
+
+async function cargarZonasExtra() {
+  try {
+    const raw = await dbGetConfig('zonas_extra', null);
+    _zonasExtra = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : [];
+  } catch { _zonasExtra = []; }
+}
+
+async function guardarZonasExtra(zonas) {
+  _zonasExtra = zonas;
+  await dbSetConfig('zonas_extra', JSON.stringify(zonas));
+}
+
+function getZonas() {
+  return [...ZONAS_DEFAULT, ..._zonasExtra];
+}
+
+/* ── Generador de consultas ────────────────────────────────────────── */
+/*
+ * Genera todas las combinaciones ciudad × zonas.
+ * Limita a MAX_CONSULTAS para no agotar la cuota de API.
+ * Prioriza las zonas con mayor probabilidad de resultados industriales.
+ */
+function generarConsultas(ciudad, rubro, zonas) {
+  const MAX_CONSULTAS = 12;
+
+  /* Elegir zonas según el tipo de rubro — no mezclar industriales con comerciales */
+  let zonasBase;
+  if (zonas) {
+    zonasBase = zonas; /* zonas manuales del usuario */
+  } else if (_zonasExtra.length > 0) {
+    zonasBase = ['', ..._zonasExtra]; /* zonas configuradas en CONFIG */
+  } else if (esRubroIndustrial(rubro)) {
+    zonasBase = ZONAS_INDUSTRIALES;   /* metalúrgica, taller, soldadora... */
+  } else {
+    zonasBase = ZONAS_GENERICAS;      /* panadería, gym, hotel... */
+  }
+
+  const queries = [];
+  for (const zona of zonasBase) {
+    const q = zona
+      ? rubro + ' ' + ciudad + ' ' + zona
+      : rubro + ' ' + ciudad + ' Argentina';
+    queries.push(q.trim());
+    if (queries.length >= MAX_CONSULTAS) break;
+  }
+
+  return queries;
+}
+
+/* ── Deduplicación inteligente ─────────────────────────────────────── */
+function deduplicarResultados(lista) {
+  const porGoogleId = new Map();
+  const porNombre   = new Map();
+
+  for (const r of lista) {
+    /* Prioridad 1: deduplicar por googleId (más confiable) */
+    if (r.googleId) {
+      if (!porGoogleId.has(r.googleId)) {
+        porGoogleId.set(r.googleId, r);
+      } else {
+        /* Fusionar: conservar el que tenga más datos */
+        const existing = porGoogleId.get(r.googleId);
+        if (!existing.telefono && r.telefono) existing.telefono = r.telefono;
+        if (!existing.web && r.web)           existing.web      = r.web;
+        if (!existing.direccion && r.direccion) existing.direccion = r.direccion;
+      }
+      continue;
+    }
+
+    /* Prioridad 2: deduplicar por nombre+ciudad normalizado */
+    const key = normalizar(r.nombre) + '|' + normalizar(r.direccion || '').slice(0, 25);
+    if (!porNombre.has(key)) {
+      porNombre.set(key, r);
+    }
+  }
+
+  /* Combinar ambos mapas, sin duplicar entre sí */
+  const resultado = [...porGoogleId.values()];
+  const idsEnGoogleMap = new Set(resultado.map(r => r.googleId).filter(Boolean));
+
+  for (const r of porNombre.values()) {
+    if (!r.googleId || !idsEnGoogleMap.has(r.googleId)) {
+      resultado.push(r);
+    }
+  }
+
+  return resultado;
+}
+
+/* ── Motor de búsqueda multi-zona ──────────────────────────────────── */
+async function buscarMultiZona(ciudad, rubro, fuente, onProgreso) {
+  const queries  = generarConsultas(ciudad, rubro);
+  const total    = queries.length;
+  let acumulados = [];
+  let errores    = 0;
+
+  for (let i = 0; i < queries.length; i++) {
+    const q = queries[i];
+    onProgreso({
+      fase:      'buscando',
+      consulta:  i + 1,
+      total,
+      query:     q,
+      encontrados: acumulados.length
+    });
+
+    try {
+      let res;
+      if (fuente === 'google') {
+        /* Para multi-zona, buscarGoogleQuery acepta el query completo */
+        res = await buscarGoogleQuery(q);
+      } else {
+        /* OSM usa grid search — la zona está en el query de Overpass */
+        res = await buscarOSM(ciudad, rubro);
+        /* OSM no necesita multi-zona porque el grid cubre toda la ciudad */
+        acumulados = acumulados.concat(res);
+        break;
+      }
+      acumulados = acumulados.concat(res);
+    } catch(e) {
+      errores++;
+      console.warn('[MultiZona] Error en query:', q, e.message);
+      /* Si falla más de la mitad, parar para no agotar cuota */
+      if (errores > Math.floor(total / 2)) break;
+    }
+
+    /* Pausa entre queries para no saturar la API */
+    if (i < queries.length - 1) {
+      await new Promise(res => setTimeout(res, 800));
+    }
+  }
+
+  return deduplicarResultados(acumulados);
+}
+
+/* ── buscarGoogleQuery: acepta query completo (con zona incluida) ──── */
+async function buscarGoogleQuery(queryCompleto) {
+  if (!state.gkey) throw new Error('Sin API Key');
+  await cargarGoogleMapsAPI(state.gkey);
+
+  const MAX_PAG      = 3;
+  const DELAY_PAG_MS = 2500;
+
+  /* Service dedicado anclado al DOM */
+  const searchDiv    = document.createElement('div');
+  searchDiv.id       = '_radar_sq_' + Date.now();
+  searchDiv.style.display = 'none';
+  document.body.appendChild(searchDiv);
+  const service = new google.maps.places.PlacesService(searchDiv);
+
+  const todosLosResultados = await new Promise((resolve) => {
+    let acumulados  = [];
+    let pagina      = 1;
+    let tid         = null;
+
+    function terminar() {
+      clearTimeout(tid);
+      const d = document.getElementById(searchDiv.id);
+      if (d) document.body.removeChild(d);
+      resolve(acumulados);
+    }
+
+    tid = setTimeout(() => terminar(), 40000);
+
+    function procesarPagina(results, status, pagination) {
+      const S = google.maps.places.PlacesServiceStatus;
+      if (status === S.OK || status === S.ZERO_RESULTS) {
+        acumulados = acumulados.concat(results || []);
+      }
+      const hayMas = pagination?.hasNextPage === true && pagina < MAX_PAG;
+      if (!hayMas) { terminar(); return; }
+      pagina++;
+      setTimeout(function() {
+        try { pagination.nextPage(procesarPagina); }
+        catch(e) { terminar(); }
+      }, DELAY_PAG_MS);
+    }
+
+    service.textSearch({ query: queryCompleto }, procesarPagina);
+  });
+
+  return todosLosResultados.map((r, i) => ({
+    nombre:    r.name,
+    direccion: r.formatted_address || '',
+    telefono:  '',
+    web:       '',
+    lat:       r.geometry?.location?.lat() ?? null,
+    lon:       r.geometry?.location?.lng() ?? null,
+    tipo:      (r.types || [])[0] || '',
+    rubro:     detectarRubro((r.types || [])[0] || ''),
+    fuente:    'google',
+    googleId:  r.place_id,
+    rating:    r.rating || 0
+  }));
+}
+
 /* ── Handler del botón BUSCAR ──────────────────────────────────────── */
 let buscarTodaZona = false;
 
@@ -2041,63 +2312,75 @@ $('#btn-buscar').addEventListener('click', async () => {
   if (!rubro)                     { toast('Ingresá el tipo de negocio'); return; }
 
   const ciudades = buscarTodaZona ? CIUDADES_ZONA : [ciudad];
+  const info     = $('#buscar-info');
+  const cont     = $('#resultados-buscar');
 
-  const info = $('#buscar-info');
-  info.innerHTML = `<span class="spinner"></span> Buscando <b>${esc(rubro)}</b> en ${ciudades.length > 1 ? ciudades.length + ' ciudades' : '<b>' + esc(ciudad) + '</b>'}...`;
+  info.innerHTML = '<span class="spinner"></span> Iniciando radar...';
   $('#btn-buscar').disabled = true;
-  $('#resultados-buscar').innerHTML = '';
+  cont.innerHTML = '';
+  state.resultados = [];
 
-  const errores = [];
-  let resultados = [];
+  const tsInicio = Date.now();
+  let totalEncontrados = 0;
 
   for (const c of ciudades) {
-    info.innerHTML = `<span class="spinner"></span> Buscando en <b>${esc(c)}</b>...`;
     try {
-      const res = fuente === 'google'
-        ? await buscarGoogle(c, rubro)
-        : await buscarOSM(c, rubro);
-      resultados = resultados.concat(res);
+      const resultados = await buscarMultiZona(c, rubro, fuente, (prog) => {
+        /* Progreso en tiempo real */
+        const elapsed  = Math.round((Date.now() - tsInicio) / 1000);
+        const restante = prog.total > 0
+          ? Math.round((elapsed / prog.consulta) * (prog.total - prog.consulta))
+          : 0;
+
+        info.innerHTML =
+          '<span class="spinner" style="width:10px;height:10px;border-width:1px;vertical-align:middle;margin-right:5px;"></span>' +
+          '<b>' + esc(c) + '</b> · Zona ' + prog.consulta + '/' + prog.total +
+          ' · <b style="color:var(--accent);">' + (prog.encontrados + totalEncontrados) + '</b> únicos' +
+          (restante > 0 ? ' · ~' + restante + 's restantes' : '') +
+          '<br><span style="font-size:10px;font-family:var(--mono);color:var(--text-dim);">→ ' + esc(prog.query) + '</span>';
+      });
+
+      /* Calcular IUT y agregar a resultados globales */
+      resultados.forEach(r => {
+        r.iut = calcularIUT({ ...r, equipos: [], tags: [] });
+      });
+      resultados.sort((a, b) => b.iut - a.iut || (b.rating || 0) - (a.rating || 0));
+
+      /* Agregar sin duplicar con lo ya encontrado en ciudades anteriores */
+      const idsExistentes = new Set(state.resultados.map(r => r.googleId || r.osmId).filter(Boolean));
+      const nuevos = resultados.filter(r => {
+        const id = r.googleId || r.osmId;
+        if (id && idsExistentes.has(id)) return false;
+        if (id) idsExistentes.add(id);
+        return true;
+      });
+
+      state.resultados = state.resultados.concat(nuevos);
+      totalEncontrados = state.resultados.length;
+
+      /* Render incremental — mostrar lo que hay sin esperar el resto */
+      renderResultados(state.resultados);
+      renderMapResults(state.resultados);
+
     } catch(e) {
-      errores.push(`${c}: ${e.message}`);
+      console.warn('[Buscar]', c, e.message);
     }
   }
 
-  /* Deduplicar */
-  const vistos = new Set();
-  resultados = resultados.filter(r => {
-    const k = normalizar(r.nombre) + '|' + normalizar(r.direccion || '').slice(0, 20);
-    if (vistos.has(k)) return false;
-    vistos.add(k);
-    return true;
-  });
-
-  /* Calcular IUT y ordenar */
-  resultados.forEach(r => { r.iut = calcularIUT({ ...r, equipos: [], tags: [] }); });
-  resultados.sort((a, b) => b.iut - a.iut || (b.rating || 0) - (a.rating || 0));
-  state.resultados = resultados;
-
-  /* Mostrar resultado o error claro */
-  if (resultados.length) {
-    info.textContent = `${resultados.length} objetivo(s) encontrado(s)`;
-  } else if (errores.length) {
-    /* Error visible en pantalla, no solo en consola */
-    info.innerHTML = `
-      <div style="background:rgba(255,51,85,0.1);border:1px solid rgba(255,51,85,0.3);border-radius:8px;padding:10px;margin-top:6px;font-size:12px;color:var(--red);">
-        <b>⚠️ Error en la búsqueda:</b><br>
-        ${errores.map(e => esc(e)).join('<br>')}
-      </div>`;
+  /* Resultado final */
+  const elapsed = Math.round((Date.now() - tsInicio) / 1000);
+  if (state.resultados.length) {
+    info.innerHTML =
+      '<b style="color:var(--accent);">' + state.resultados.length + '</b> objetivos únicos encontrados' +
+      ' · ' + elapsed + 's · ' +
+      (fuente === 'google' ? 'Google Places' : 'OpenStreetMap');
   } else {
-    info.textContent = 'Sin resultados. Probá con otro término o ciudad.';
+    info.textContent = 'Sin resultados. Probá con otro rubro o ciudad.';
   }
 
-  renderResultados(resultados);
-  if (resultados.length) renderMapResults(resultados);
-
-  /* Enriquecer teléfonos DESPUÉS de renderizar.
-   * Se lanza con delay para no competir con getDetails durante la búsqueda.
-   * La paginación ya terminó en este punto (buscarGoogle es await completo). */
-  if (resultados.some(r => r.fuente === 'google')) {
-    setTimeout(() => lanzarEnriquecimiento(resultados), 500);
+  /* Enriquecer teléfonos en background */
+  if (state.resultados.some(r => r.fuente === 'google')) {
+    setTimeout(() => lanzarEnriquecimiento(state.resultados), 500);
   }
 
   $('#btn-buscar').disabled = false;
@@ -2737,6 +3020,30 @@ $('#btn-borrar-todo').addEventListener('click', async () => {
 function cargarConfigUI() {
   $('#inp-google-key').value = state.gkey || '';
   cargarMensajesRubro($('#inp-edit-rubro').value);
+  renderZonasConfig();
+}
+
+function renderZonasConfig() {
+  const cont = $('#zonas-config-lista');
+  if (!cont) return;
+  const todas = getZonas().filter(z => z); /* sin el vacío inicial */
+  cont.innerHTML = todas.map((z, i) => {
+    const esDefault = i < ZONAS_DEFAULT.filter(z=>z).length;
+    return '<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px;">' +
+      '<span style="flex:1;font-size:12px;font-family:var(--mono);color:' + (esDefault ? 'var(--text-dim)' : 'var(--accent)') + ';">' +
+      esc(z) + (esDefault ? ' <span style=\"font-size:9px;\">(default)</span>' : '') + '</span>' +
+      (!esDefault ? '<button class="btn btn-sm btn-r" style="padding:4px 8px;min-height:28px;" data-del-zona="' + esc(z) + '">✕</button>' : '') +
+      '</div>';
+  }).join('');
+
+  cont.querySelectorAll('[data-del-zona]').forEach(b => {
+    b.addEventListener('click', async () => {
+      const z = b.dataset.delZona;
+      await guardarZonasExtra(_zonasExtra.filter(x => x !== z));
+      renderZonasConfig();
+      toast('Zona eliminada');
+    });
+  });
 }
 
 function cargarMensajesRubro(rubro) {
@@ -2747,6 +3054,18 @@ function cargarMensajesRubro(rubro) {
 }
 
 $('#inp-edit-rubro').addEventListener('change', e => cargarMensajesRubro(e.target.value));
+
+$('#btn-add-zona').addEventListener('click', async () => {
+  const inp = $('#inp-nueva-zona');
+  if (!inp) return;
+  const z = inp.value.trim();
+  if (!z) { toast('Escribí una zona'); return; }
+  if (getZonas().includes(z)) { toast('Zona ya existe'); return; }
+  await guardarZonasExtra([..._zonasExtra, z]);
+  inp.value = '';
+  renderZonasConfig();
+  toast('Zona agregada: ' + z);
+});
 
 $('#btn-save-key').addEventListener('click', async () => {
   state.gkey = $('#inp-google-key').value.trim();
@@ -2898,6 +3217,9 @@ async function init() {
 
     /* Cargar cache de detalles Google (teléfonos) */
     await cargarDetallesCache();
+
+    /* Cargar zonas extra configuradas por el usuario */
+    await cargarZonasExtra();
 
     const rutaRaw = await dbGetConfig('ruta', null);
     try {
