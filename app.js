@@ -1929,62 +1929,66 @@ async function buscarGoogle(ciudad, rubro) {
     let acumulados  = [];
     let pagina      = 1;
     let timeoutGral = null;
+    const diag      = $('#buscar-info');
 
-    /* Timeout global: si en 30s no terminó, devolver lo que hay */
-    timeoutGral = setTimeout(() => {
-      console.warn('[Pag] Timeout global — devolviendo', acumulados.length, 'resultados');
+    function terminar() {
+      clearTimeout(timeoutGral);
+      /* Limpiar el div del service DENTRO de la Promise,
+         después de resolver. Si lo limpiamos afuera (en el await),
+         el GC destruye el service antes de que llegue la página 2. */
+      const svcDiv = document.getElementById('_radar_search_svc');
+      if (svcDiv) document.body.removeChild(svcDiv);
       resolve(acumulados);
-    }, 30000);
+    }
+
+    /* Timeout de seguridad: 45s total para las 3 páginas */
+    timeoutGral = setTimeout(() => {
+      console.warn('[Pag] Timeout — páginas obtenidas: ' + (pagina-1));
+      terminar();
+    }, 45000);
 
     function procesarPagina(results, status, pagination) {
-      const diag = $('#buscar-info');
+      const S = google.maps.places.PlacesServiceStatus;
 
-      if (status === google.maps.places.PlacesServiceStatus.OK ||
-          status === google.maps.places.PlacesServiceStatus.ZERO_RESULTS) {
+      if (status === S.OK || status === S.ZERO_RESULTS) {
         acumulados = acumulados.concat(results || []);
       }
 
-      /* DIAGNÓSTICO VISIBLE — aparece en pantalla debajo del buscador */
-      const diagInfo = [
-        `Pág ${pagina}: ${(results||[]).length} resultados (total: ${acumulados.length})`,
-        `status: ${status}`,
-        `hasNextPage: ${pagination?.hasNextPage ?? 'N/A'}`,
-        `pagination existe: ${!!pagination}`,
-        `nextPage es función: ${typeof pagination?.nextPage === 'function'}`
-      ].join(' | ');
-      if (diag) diag.innerHTML = `<span style="font-size:10px;font-family:var(--mono);color:var(--accent);">${diagInfo}</span>`;
-      console.log('[Pag]', diagInfo);
-
-      const hayMas = pagination?.hasNextPage && pagina < MAX_PAG;
+      /* Diagnóstico visible en pantalla */
+      const hayMas  = pagination?.hasNextPage === true && pagina < MAX_PAG;
+      const diagTxt =
+        'Pág ' + pagina + ': ' + (results||[]).length + ' resultados' +
+        ' (total: ' + acumulados.length + ')' +
+        ' | hasNextPage: ' + (pagination?.hasNextPage ?? 'N/A') +
+        ' | nextPage fn: ' + (typeof pagination?.nextPage === 'function') +
+        (hayMas ? ' → pidiendo pág ' + (pagina+1) + '...' : ' → FIN');
+      if (diag) diag.innerHTML =
+        '<span style="font-size:10px;font-family:var(--mono);color:var(--accent);">' +
+        diagTxt + '</span>';
+      console.log('[Pag]', diagTxt);
 
       if (!hayMas) {
-        clearTimeout(timeoutGral);
-        resolve(acumulados);
+        terminar();
         return;
       }
 
       pagina++;
-      setTimeout(() => {
+      setTimeout(function() {
         try {
           pagination.nextPage(procesarPagina);
         } catch(e) {
-          if (diag) diag.textContent = 'nextPage() error: ' + e.message;
-          clearTimeout(timeoutGral);
-          resolve(acumulados);
+          console.warn('[Pag] nextPage() excepción:', e.message);
+          terminar();
         }
       }, DELAY_PAG_MS);
     }
 
-    /* Lanzar página 1 */
+    /* Página 1 */
     service.textSearch(
-      { query: `${rubro} ${ciudad}`, location, radius: 15000 },
+      { query: rubro + ' ' + ciudad, location: location, radius: 15000 },
       procesarPagina
     );
   });
-
-  /* Limpiar el div del service — ya no se necesita */
-  const _svcDiv = document.getElementById('_radar_search_svc');
-  if (_svcDiv) document.body.removeChild(_svcDiv);
 
   /* Guardar rubro/ciudad para referencia */
   buscarGoogle._rubro  = rubro;
