@@ -466,24 +466,514 @@ async function crearBackup(tipo='auto') {
   }
 }
 
-function exportarJSON() {
-  const data = {
-    version: 6,
-    fecha: new Date().toISOString(),
-    leads: state.leads,
-    ruta: state.ruta,
-    mensajes: state.mensajes
-  };
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type:'application/json' });
+/* ======================================================================
+   CAMPAÑA WHATSAPP — EXPORTACIÓN MASIVA INTELIGENTE
+   ======================================================================
+   Genera una lista de contactos con mensajes personalizados.
+   El usuario los envía uno por uno desde el modal de campaña.
+
+   FLUJO:
+   1. Usuario abre "CAMPAÑA WHATSAPP"
+   2. Elige: qué leads incluir (filtro por estado/prioridad)
+   3. Elige: tipo de mensaje (primer contacto / seguimiento / cierre)
+   4. Ve la lista con preview del mensaje para cada lead
+   5. Toca "ENVIAR" en cada uno → abre WhatsApp con el mensaje listo
+   6. La app marca automáticamente el lead como "contactado"
+   ====================================================================== */
+
+function abrirCampanaWhatsApp() {
+  /* Solo leads con teléfono */
+  const conTel = state.leads.filter(l =>
+    l.telefono && limpiarTel(l.telefono).length >= 6 &&
+    l.estado !== 'descartado'
+  );
+
+  if (!conTel.length) {
+    toast('Sin leads con teléfono cargado');
+    return;
+  }
+
+  /* Crear overlay modal */
+  const overlay = document.createElement('div');
+  overlay.id    = 'modal-campana-wa';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:900;' +
+    'display:flex;flex-direction:column;overflow:hidden;';
+
+  overlay.innerHTML =
+    '<div style="background:var(--bg-card);border-bottom:1px solid var(--border-lit);' +
+      'padding:14px;flex-shrink:0;">' +
+      '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">' +
+        '<div style="font-family:var(--cond);font-size:17px;font-weight:800;color:var(--blue);">' +
+          '📱 CAMPAÑA WHATSAPP' +
+        '</div>' +
+        '<button id="wa-camp-cerrar" class="btn btn-sm" style="padding:5px 10px;min-height:30px;">✕</button>' +
+      '</div>' +
+
+      /* Filtros */
+      '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;">' +
+        '<select id="wa-camp-tipo" style="flex:1;min-width:0;">' +
+          '<option value="primero">Primer contacto</option>' +
+          '<option value="seguimiento">Seguimiento</option>' +
+          '<option value="cierre">Cierre / Propuesta</option>' +
+        '</select>' +
+        '<select id="wa-camp-filtro" style="flex:1;min-width:0;">' +
+          '<option value="todos">Todos con tel.</option>' +
+          '<option value="no-contactado">Sin contactar</option>' +
+          '<option value="contactado">Contactados</option>' +
+          '<option value="seguimiento-hoy">Seguimiento hoy</option>' +
+          '<option value="alta">Prioridad alta</option>' +
+          '<option value="cliente">Clientes</option>' +
+        '</select>' +
+      '</div>' +
+
+      /* Stats y botón aplicar */
+      '<div style="display:flex;align-items:center;justify-content:space-between;">' +
+        '<div id="wa-camp-stats" style="font-family:var(--mono);font-size:11px;' +
+          'color:var(--text-dim);"></div>' +
+        '<button id="wa-camp-aplicar" class="btn btn-sm btn-b" ' +
+          'style="padding:5px 12px;min-height:30px;font-size:11px;">APLICAR</button>' +
+      '</div>' +
+    '</div>' +
+
+    /* Lista de contactos */
+    '<div id="wa-camp-lista" style="flex:1;overflow-y:auto;padding:10px 12px 24px;' +
+      '-webkit-overflow-scrolling:touch;"></div>';
+
+  document.body.appendChild(overlay);
+
+  function getLeadsFiltrados() {
+    const filtro = $('#wa-camp-filtro').value;
+    const ahora  = Date.now();
+    return conTel.filter(l => {
+      if (filtro === 'no-contactado')   return l.estado === 'no-contactado';
+      if (filtro === 'contactado')      return ['contactado','respondio','visitado'].includes(l.estado);
+      if (filtro === 'seguimiento-hoy') return l.seguimientoFecha && new Date(l.seguimientoFecha).getTime() <= ahora;
+      if (filtro === 'alta')            return l.prioridad === 'alta' || calcularIUT(l) >= 45;
+      if (filtro === 'cliente')         return ['cliente','recurrente','mantenimiento'].includes(l.estado);
+      return true; /* todos */
+    }).sort((a, b) => calcularIUT(b) - calcularIUT(a));
+  }
+
+  function buildMensaje(lead, tipo) {
+    const rubro = lead.rubro || 'comercio';
+    const tpl   = state.mensajes[rubro]?.[tipo]
+               || state.mensajes.comercio?.[tipo]
+               || '';
+    return tpl.replace(/\{nombre\}/gi, lead.nombre);
+  }
+
+  function renderLista() {
+    const tipo    = $('#wa-camp-tipo').value;
+    const leads   = getLeadsFiltrados();
+    const cont    = $('#wa-camp-lista');
+    const stats   = $('#wa-camp-stats');
+
+    if (stats) stats.textContent = leads.length + ' contacto(s) seleccionados';
+
+    if (!leads.length) {
+      cont.innerHTML = '<div class="empty-state"><span class="ico">📭</span>' +
+        'Sin leads con ese filtro.</div>';
+      return;
+    }
+
+    cont.innerHTML = leads.map((l, i) => {
+      const iut = calcularIUT(l);
+      const msg = buildMensaje(l, tipo);
+      const prio = calcularPrioridadTactica(l);
+
+      return '<div style="background:var(--bg-panel);border:1px solid var(--border);' +
+        'border-radius:var(--r);padding:11px 12px;margin-bottom:8px;" data-wid="' + l.id + '">' +
+
+        /* Header: nombre + IUT */
+        '<div style="display:flex;align-items:flex-start;justify-content:space-between;' +
+          'gap:8px;margin-bottom:4px;">' +
+          '<div>' +
+            '<div style="font-size:14px;font-weight:800;">' + esc(l.nombre) + '</div>' +
+            '<div style="font-size:11px;color:var(--text-dim);">📞 ' + esc(l.telefono) + '</div>' +
+          '</div>' +
+          '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px;">' +
+            '<span class="iut-badge ' + iutClase(iut) + '" style="font-size:9px;">' +
+              iutLabel(iut) + iut + '</span>' +
+            '<span style="font-size:9px;font-weight:700;padding:2px 6px;border-radius:4px;border:1px solid;' +
+              prio.css + '">' + prio.ico + ' ' + prio.label + '</span>' +
+          '</div>' +
+        '</div>' +
+
+        /* Preview del mensaje (primeras 2 líneas) */
+        '<div style="font-size:11px;color:var(--text-dim);font-style:italic;' +
+          'background:rgba(45,143,255,0.06);border-left:2px solid var(--blue);' +
+          'padding:5px 8px;border-radius:0 5px 5px 0;margin-bottom:8px;' +
+          'white-space:pre-wrap;max-height:52px;overflow:hidden;">' +
+          esc(msg.split('\n').slice(0,3).join('\n')) +
+          (msg.split('\n').length > 3 ? '\n...' : '') +
+        '</div>' +
+
+        /* Botones */
+        '<div style="display:flex;gap:6px;">' +
+          '<button class="btn btn-sm btn-b wa-camp-enviar" data-idx="' + i + '" ' +
+            'style="flex:1;">📤 ENVIAR</button>' +
+          '<button class="btn btn-sm wa-camp-skip" data-idx="' + i + '" ' +
+            'style="padding:7px 10px;min-height:34px;font-size:11px;">SALTAR</button>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+
+    /* Bindear botones */
+    cont.querySelectorAll('.wa-camp-enviar').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const lead = leads[+btn.dataset.idx];
+        if (!lead) return;
+        const tipo2 = $('#wa-camp-tipo').value;
+        const msg2  = buildMensaje(lead, tipo2);
+        const tel   = limpiarTel(lead.telefono);
+
+        /* Abrir WhatsApp */
+        window.open('https://wa.me/' + tel + '?text=' + encodeURIComponent(msg2), '_blank');
+
+        /* Actualizar estado del lead */
+        const upd = {
+          ...lead,
+          estado:           lead.estado === 'no-contactado' ? 'contactado' : lead.estado,
+          intentosContacto: (lead.intentosContacto || 0) + 1,
+          historial:        [...(lead.historial||[]), {
+            fecha:  new Date().toISOString(),
+            accion: 'WhatsApp ' + tipo2 + ' (campaña)'
+          }]
+        };
+        await dbSaveLead(upd);
+
+        /* Marcar visualmente como enviado */
+        const card = cont.querySelector('[data-wid="' + lead.id + '"]');
+        if (card) {
+          card.style.opacity = '0.45';
+          card.style.pointerEvents = 'none';
+          const envBtn = card.querySelector('.wa-camp-enviar');
+          if (envBtn) { envBtn.textContent = '✓ ENVIADO'; envBtn.classList.remove('btn-b'); }
+        }
+      });
+    });
+
+    cont.querySelectorAll('.wa-camp-skip').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const card = cont.querySelector('[data-wid="' + leads[+btn.dataset.idx]?.id + '"]');
+        if (card) { card.style.display = 'none'; }
+      });
+    });
+  }
+
+  /* Listeners de filtros */
+  $('#wa-camp-aplicar').addEventListener('click', renderLista);
+  $('#wa-camp-tipo').addEventListener('change', renderLista);
+  $('#wa-camp-cerrar').addEventListener('click', () => {
+    if (overlay.parentNode) document.body.removeChild(overlay);
+  });
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay && overlay.parentNode) document.body.removeChild(overlay);
+  });
+
+  /* Render inicial */
+  renderLista();
+}
+
+/* Listener del botón */
+$('#btn-exportar-wa').addEventListener('click', abrirCampanaWhatsApp);
+
+/* ======================================================================
+   SISTEMA DE EXPORTACIÓN AVANZADA
+   ======================================================================
+   Formatos:
+   - JSON completo (backup/sync entre dispositivos)
+   - CSV de leads (para Excel / Google Sheets)
+   - TXT de contactos (nombres + teléfonos para copiar)
+   - Filtros: todos / solo clientes / solo con teléfono / por estado
+
+   Importación inteligente:
+   - Merge: agrega leads nuevos sin borrar los existentes
+   - Reemplazar: sobreescribe todo (comportamiento anterior)
+   - Detecta duplicados por id y googleId
+   ====================================================================== */
+
+function descargarArchivo(contenido, nombre, tipo) {
+  const blob = new Blob([contenido], { type: tipo });
   const url  = URL.createObjectURL(blob);
   const a    = document.createElement('a');
-  const fecha = new Date().toISOString().slice(0,10).replace(/-/g,'_');
   a.href = url;
-  a.download = `electromel_radar_${fecha}.json`;
+  a.download = nombre;
   a.click();
   URL.revokeObjectURL(url);
-  toast('Backup exportado ✓');
 }
+
+function exportarJSON() {
+  const fecha = new Date().toISOString().slice(0,10).replace(/-/g,'_');
+  const data  = {
+    version:  6,
+    fecha:    new Date().toISOString(),
+    leads:    state.leads,
+    ruta:     state.ruta,
+    mensajes: state.mensajes
+  };
+  descargarArchivo(JSON.stringify(data, null, 2), 'electromel_radar_' + fecha + '.json', 'application/json');
+  toast('✓ JSON exportado — ' + state.leads.length + ' leads');
+}
+
+function exportarCSV(leads) {
+  const cols = ['nombre','telefono','direccion','zona','rubro','estado','nivel','notas','fuente','lat','lon','creado'];
+  const esc2 = v => {
+    if (v == null) return '';
+    const s = String(v).replace(/"/g, '""');
+    return s.includes(',') || s.includes('"') || s.includes('\n') ? '"' + s + '"' : s;
+  };
+  const header = cols.join(',');
+  const rows   = leads.map(l =>
+    cols.map(c => {
+      if (c === 'creado') return esc2(l.creado ? new Date(l.creado).toLocaleDateString('es-AR') : '');
+      return esc2(l[c]);
+    }).join(',')
+  );
+  return [header, ...rows].join('\n');
+}
+
+function exportarTXT(leads) {
+  return leads
+    .filter(l => l.telefono && limpiarTel(l.telefono).length >= 6)
+    .map(l => l.nombre + '\t' + l.telefono + (l.direccion ? '\t' + l.direccion : ''))
+    .join('\n');
+}
+
+function abrirExportadorAvanzado() {
+  if (document.getElementById('modal-exportar')) return;
+
+  const overlay = document.createElement('div');
+  overlay.id    = 'modal-exportar';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:900;' +
+    'display:flex;align-items:flex-end;justify-content:center;';
+
+  /* Estado del exportador */
+  let filtroActivo = 'todos';
+  let formatoActivo = 'json';
+
+  const FILTROS = [
+    { id:'todos',       label:'Todos',             fn: l => l.estado !== 'descartado' },
+    { id:'con-tel',     label:'Con teléfono',       fn: l => l.telefono && limpiarTel(l.telefono).length >= 6 },
+    { id:'clientes',    label:'Clientes',           fn: l => ['cliente','recurrente','mantenimiento'].includes(l.estado) },
+    { id:'no-contact',  label:'Sin contactar',      fn: l => l.estado === 'no-contactado' },
+    { id:'alta',        label:'Prioridad alta',     fn: l => calcularIUT(l) >= 45 },
+    { id:'con-coords',  label:'Con coordenadas',    fn: l => l.lat && l.lon }
+  ];
+
+  const FORMATOS = [
+    { id:'json', label:'JSON', desc:'Backup completo, importable en otro dispositivo' },
+    { id:'csv',  label:'CSV',  desc:'Excel / Google Sheets — una fila por lead' },
+    { id:'txt',  label:'TXT',  desc:'Lista de contactos: nombre + teléfono' }
+  ];
+
+  function getLeadsFiltrados() {
+    const f = FILTROS.find(x => x.id === filtroActivo);
+    return f ? state.leads.filter(f.fn) : state.leads;
+  }
+
+  function buildHTML() {
+    const leads = getLeadsFiltrados();
+    return '<div style="background:var(--bg-card);border-top:2px solid var(--accent);' +
+      'border-radius:20px 20px 0 0;width:100%;max-width:600px;' +
+      'padding:16px 14px 32px;max-height:88vh;overflow-y:auto;">' +
+
+      /* Header */
+      '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">' +
+        '<div style="font-family:var(--cond);font-size:17px;font-weight:800;color:var(--accent);">⬇ EXPORTAR DATOS</div>' +
+        '<button id="exp-cerrar" class="btn btn-sm" style="padding:5px 10px;min-height:30px;">✕</button>' +
+      '</div>' +
+
+      /* Filtro qué exportar */
+      '<div style="font-size:10px;font-weight:700;font-family:var(--mono);color:var(--text-dim);' +
+        'letter-spacing:1px;margin-bottom:6px;">¿QUÉ EXPORTAR?</div>' +
+      '<div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:12px;">' +
+        FILTROS.map(f =>
+          '<button class="filtro-btn exp-filtro' + (f.id===filtroActivo?' active':'') + '" data-fid="' + f.id + '">' +
+          f.label + '</button>'
+        ).join('') +
+      '</div>' +
+
+      /* Formato */
+      '<div style="font-size:10px;font-weight:700;font-family:var(--mono);color:var(--text-dim);' +
+        'letter-spacing:1px;margin-bottom:6px;">FORMATO</div>' +
+      '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:12px;">' +
+        FORMATOS.map(f =>
+          '<button class="exp-fmt' + (f.id===formatoActivo?' btn btn-g btn-sm':' btn btn-sm') + '" ' +
+          'data-fmt="' + f.id + '" style="flex-direction:column;height:auto;padding:8px 6px;text-align:center;">' +
+            '<span style="font-size:14px;display:block;margin-bottom:2px;">' +
+              (f.id==='json'?'📦':f.id==='csv'?'📊':'📋') + '</span>' +
+            '<span style="font-size:12px;font-weight:800;">' + f.label + '</span>' +
+            '<span style="font-size:9px;color:' + (f.id===formatoActivo?'rgba(0,26,14,0.7)':'var(--text-dim)') + ';' +
+              'display:block;line-height:1.2;margin-top:2px;">' + f.desc + '</span>' +
+          '</button>'
+        ).join('') +
+      '</div>' +
+
+      /* Preview */
+      '<div style="background:var(--bg-panel);border:1px solid var(--border-lit);border-radius:var(--r);' +
+        'padding:10px;margin-bottom:12px;">' +
+        '<div style="font-family:var(--mono);font-size:11px;color:var(--text-dim);margin-bottom:5px;">' +
+          'RESUMEN' +
+        '</div>' +
+        '<div id="exp-preview" style="font-size:13px;"></div>' +
+      '</div>' +
+
+      /* Botón exportar */
+      '<button class="btn btn-g btn-block" id="exp-descargar" style="font-size:15px;">' +
+        '⬇ DESCARGAR' +
+      '</button>' +
+
+      /* Separador importación */
+      '<hr style="margin:14px 0;">' +
+      '<div style="font-size:13px;font-weight:800;font-family:var(--cond);margin-bottom:8px;">IMPORTAR DATOS</div>' +
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">' +
+        '<button class="btn btn-sm" id="exp-merge" style="flex-direction:column;height:auto;padding:9px 6px;text-align:center;">' +
+          '<span style="font-size:13px;display:block;">🔀</span>' +
+          '<span style="font-size:12px;font-weight:800;">MERGE</span>' +
+          '<span style="font-size:9px;color:var(--text-dim);display:block;">Agrega sin borrar</span>' +
+        '</button>' +
+        '<button class="btn btn-sm btn-r" id="exp-reemplazar" style="flex-direction:column;height:auto;padding:9px 6px;text-align:center;">' +
+          '<span style="font-size:13px;display:block;">♻️</span>' +
+          '<span style="font-size:12px;font-weight:800;">REEMPLAZAR</span>' +
+          '<span style="font-size:9px;color:var(--text-dim);display:block;">Sobreescribe todo</span>' +
+        '</button>' +
+      '</div>' +
+      '<input type="file" id="exp-file-input" accept=".json" style="display:none;">' +
+    '</div>';
+  }
+
+  function actualizarPreview() {
+    const leads    = getLeadsFiltrados();
+    const conTel   = leads.filter(l => l.telefono && limpiarTel(l.telefono).length >= 6).length;
+    const clientes = leads.filter(l => ['cliente','recurrente','mantenimiento'].includes(l.estado)).length;
+    const prev     = document.getElementById('exp-preview');
+    if (!prev) return;
+    prev.innerHTML =
+      '<b style="color:var(--accent);font-family:var(--mono);">' + leads.length + '</b> leads · ' +
+      '<span style="color:var(--text-dim);">' + conTel + ' con teléfono · ' + clientes + ' clientes</span>';
+  }
+
+  function bindListeners() {
+    document.getElementById('exp-cerrar').addEventListener('click', () => {
+      if (overlay.parentNode) document.body.removeChild(overlay);
+    });
+    overlay.addEventListener('click', e => {
+      if (e.target === overlay && overlay.parentNode) document.body.removeChild(overlay);
+    });
+
+    /* Filtros */
+    overlay.querySelectorAll('.exp-filtro').forEach(b => {
+      b.addEventListener('click', () => {
+        filtroActivo = b.dataset.fid;
+        overlay.querySelector('.modal-inner').innerHTML = buildHTML();
+        bindListeners();
+      });
+    });
+
+    /* Formatos */
+    overlay.querySelectorAll('.exp-fmt').forEach(b => {
+      b.addEventListener('click', () => {
+        formatoActivo = b.dataset.fmt;
+        overlay.querySelector('.modal-inner').innerHTML = buildHTML();
+        bindListeners();
+      });
+    });
+
+    actualizarPreview();
+
+    /* Descargar */
+    document.getElementById('exp-descargar').addEventListener('click', () => {
+      const leads = getLeadsFiltrados();
+      const fecha = new Date().toISOString().slice(0,10).replace(/-/g,'_');
+      if (formatoActivo === 'json') {
+        const data = { version:6, fecha:new Date().toISOString(), leads, ruta:state.ruta, mensajes:state.mensajes };
+        descargarArchivo(JSON.stringify(data, null, 2), 'electromel_' + fecha + '.json', 'application/json');
+        toast('✓ JSON — ' + leads.length + ' leads');
+      } else if (formatoActivo === 'csv') {
+        descargarArchivo(exportarCSV(leads), 'electromel_' + fecha + '.csv', 'text/csv;charset=utf-8');
+        toast('✓ CSV — ' + leads.length + ' filas');
+      } else {
+        const txt = exportarTXT(leads);
+        descargarArchivo(txt, 'electromel_contactos_' + fecha + '.txt', 'text/plain;charset=utf-8');
+        const n = txt.split('\n').filter(Boolean).length;
+        toast('✓ TXT — ' + n + ' contactos con teléfono');
+      }
+    });
+
+    /* Merge */
+    document.getElementById('exp-merge').addEventListener('click', () => {
+      const inp = document.getElementById('exp-file-input');
+      inp.dataset.modo = 'merge';
+      inp.click();
+    });
+
+    /* Reemplazar */
+    document.getElementById('exp-reemplazar').addEventListener('click', () => {
+      if (!confirm('¿Reemplazar TODOS los leads? Los actuales se perderán.')) return;
+      const inp = document.getElementById('exp-file-input');
+      inp.dataset.modo = 'reemplazar';
+      inp.click();
+    });
+
+    /* File input */
+    document.getElementById('exp-file-input').addEventListener('change', async e => {
+      const f = e.target.files[0]; if (!f) return;
+      const modo = e.target.dataset.modo;
+      const reader = new FileReader();
+      reader.onload = async ev => {
+        try {
+          const data = JSON.parse(ev.target.result);
+          if (!data.leads) throw new Error('Archivo sin leads');
+
+          if (modo === 'merge') {
+            /* Merge: agrega solo los que no existen */
+            const idsExistentes = new Set([
+              ...state.leads.map(l => l.id),
+              ...state.leads.map(l => l.googleId).filter(Boolean),
+              ...state.leads.map(l => l.osmId).filter(Boolean)
+            ]);
+            const nuevos = data.leads.filter(l => {
+              if (idsExistentes.has(l.id)) return false;
+              if (l.googleId && idsExistentes.has(l.googleId)) return false;
+              if (l.osmId    && idsExistentes.has(l.osmId))    return false;
+              return true;
+            });
+            if (!nuevos.length) { toast('Sin leads nuevos para agregar'); return; }
+            for (const l of nuevos) { delete l._iut; await DB.saveLead(l); }
+            state.leads = [...state.leads, ...nuevos];
+            state.leads.forEach(l => delete l._iut);
+            renderLeads(); renderMapLeads();
+            toast('✓ Merge: +' + nuevos.length + ' leads nuevos');
+          } else {
+            /* Reemplazar */
+            await DB.clearLeads();
+            await DB.saveLeads(data.leads);
+            state.leads = data.leads;
+            state.leads.forEach(l => delete l._iut);
+            if (data.mensajes) state.mensajes = data.mensajes;
+            if (data.ruta)     state.ruta     = data.ruta;
+            _leadMarkersMap.forEach(m => map.removeLayer(m));
+            _leadMarkersMap.clear();
+            renderLeads(); renderMapLeads();
+            toast('✓ Importados ' + data.leads.length + ' leads');
+          }
+          if (overlay.parentNode) document.body.removeChild(overlay);
+        } catch(err) {
+          toast('Error: ' + err.message);
+        }
+      };
+      reader.readAsText(f);
+      e.target.value = '';
+    });
+  }
+
+  overlay.innerHTML = '<div class="modal-inner" style="width:100%;max-width:600px;">' + buildHTML() + '</div>';
+  document.body.appendChild(overlay);
+  bindListeners();
+}
+
+$('#btn-exportar-avanzado').addEventListener('click', abrirExportadorAvanzado);
 
 /* ======================================================================
    11. MAPA LEAFLET
@@ -892,56 +1382,92 @@ function renderTerreno() {
   });
 }
 
+/* ── Score táctico de prioridad diaria ─────────────────────────────── */
+function calcularPrioridadTactica(l) {
+  const ahora = Date.now();
+
+  /* CONTACTAR HOY */
+  if (l.estado === 'urgente') return { nivel:'hoy', ico:'🔴', label:'CONTACTAR HOY', css:'color:#ff3355;background:rgba(255,51,85,0.12);border-color:rgba(255,51,85,0.4);' };
+  if (l.seguimientoFecha && new Date(l.seguimientoFecha).getTime() <= ahora) return { nivel:'hoy', ico:'⏰', label:'CONTACTAR HOY', css:'color:#ff6b1a;background:rgba(255,107,26,0.12);border-color:rgba(255,107,26,0.4);' };
+  if (calcularIUT(l) >= 70) return { nivel:'hoy', ico:'⚡', label:'CONTACTAR HOY', css:'color:#ff3355;background:rgba(255,51,85,0.12);border-color:rgba(255,51,85,0.4);' };
+
+  /* ESTA SEMANA */
+  if (l.estado === 'presupuesto' || l.estado === 'esperando') return { nivel:'semana', ico:'💰', label:'ESTA SEMANA', css:'color:#f5c400;background:rgba(245,196,0,0.1);border-color:rgba(245,196,0,0.35);' };
+  if (l.seguimientoFecha) {
+    const diasHasta = (new Date(l.seguimientoFecha).getTime() - ahora) / 86400000;
+    if (diasHasta <= 7) return { nivel:'semana', ico:'📅', label:'ESTA SEMANA', css:'color:#f5c400;background:rgba(245,196,0,0.1);border-color:rgba(245,196,0,0.35);' };
+  }
+  if (calcularIUT(l) >= 45) return { nivel:'semana', ico:'🎯', label:'ESTA SEMANA', css:'color:#f5c400;background:rgba(245,196,0,0.1);border-color:rgba(245,196,0,0.35);' };
+  if (['cliente','recurrente','mantenimiento'].includes(l.estado)) return { nivel:'semana', ico:'⭐', label:'REVISITA', css:'color:#00e8a0;background:rgba(0,232,160,0.1);border-color:rgba(0,232,160,0.35);' };
+
+  /* SIN URGENCIA */
+  return { nivel:'baja', ico:'🔵', label:'SIN URGENCIA', css:'color:#4a6888;background:rgba(74,104,136,0.08);border-color:rgba(74,104,136,0.25);' };
+}
+
 function renderTerrenoCard(l) {
-  const tel     = !!(l.telefono && limpiarTel(l.telefono).length >= 6);
-  const src     = l.fuente || 'manual';
-  const srcLbl  = src==='google'?'GOOGLE':src==='manual'?'MANUAL':src==='osm'?'OSM':'TERRENO';
-  const iut     = l._iut || calcularIUT(l);
-  const iutCls  = iutClase(iut);
+  const tel    = !!(l.telefono && limpiarTel(l.telefono).length >= 6);
+  const src    = l.fuente || 'manual';
+  const srcLbl = src==='google'?'GOOGLE':src==='manual'?'MANUAL':src==='osm'?'OSM':'TERRENO';
+  const iut    = l._iut || calcularIUT(l);
+  const iutCls = iutClase(iut);
+  const prio   = calcularPrioridadTactica(l);
 
   const equiposHtml = (l.equipos||[]).length
-    ? `<div class="equipos-chips">${l.equipos.map(e => {
+    ? '<div class="equipos-chips">' + l.equipos.map(e => {
         const eq = EQUIPOS_CATALOGO.find(x=>x.id===e);
-        return eq ? `<span class="equipo-chip">${eq.ico} ${eq.label}</span>` : '';
-      }).join('')}</div>`
+        return eq ? '<span class="equipo-chip">' + eq.ico + ' ' + eq.label + '</span>' : '';
+      }).join('') + '</div>'
     : '';
 
   const notaDisplay = l.notas
-    ? `<div class="tc-nota">📝 ${esc(l.notas.slice(0,60))}${l.notas.length>60?'…':''}</div>` : '';
-
-  const seguHtml = l.seguimientoFecha && esHoyOAtrasado(l.seguimientoFecha)
-    ? `<span style="color:var(--em-orange);font-size:10px;font-weight:700;font-family:var(--mono);">⏰ HOY</span>` : '';
+    ? '<div class="tc-nota">📝 ' + esc(l.notas.slice(0,60)) + (l.notas.length>60?'…':'') + '</div>'
+    : '';
 
   const urgente = l.estado==='urgente' || iut >= 70;
 
-  return `
-  <div class="terreno-card src-${src}${urgente?' urgente':''}" data-tid="${l.id}">
-    <div class="tc-top">
-      <div class="tc-name">${esc(l.nombre)}</div>
-      <div class="tc-iut"><span class="iut-badge ${iutCls}">${iutLabel(iut)} IUT·${iut}</span></div>
-    </div>
-    <div class="tc-meta">
-      <span class="tc-dist">◈ ${fmtDist(l._dist)}</span>
-      <span class="src-badge ${src}">${srcLbl}</span>
-      ${nivelBadge(l.nivel||'bajo')}
-      ${seguHtml}
-    </div>
-    ${equiposHtml}
-    ${notaDisplay}
-    <div class="tc-actions-primary">
-      <button class="tc-btn primary-ir" data-ta="ir">NAVEGAR</button>
-      ${tel ? `<button class="tc-btn primary-wa" data-ta="wa">WHATSAPP</button>`
-            : `<button class="tc-btn" data-ta="abrir">VER FICHA</button>`}
-    </div>
-    <div class="tc-actions-secondary">
-      ${tel ? `<button class="tc-btn btn-sm-ico" data-ta="llamar" title="Llamar">📞</button>` : ''}
-      <button class="tc-btn btn-sm-ico" data-ta="visitado" title="Marcar visitado">✅</button>
-      <button class="tc-btn btn-sm-ico" data-ta="nota"     title="Nota rápida">📝</button>
-      <button class="tc-btn btn-sm-ico" data-ta="ruta"     title="+ Ruta">🗺️</button>
-      <button class="tc-btn btn-sm-ico btn-urgente" data-ta="urgente" title="Marcar urgente">🚨</button>
-      <button class="tc-btn btn-sm-ico" data-ta="abrir"    title="Editar">✏️</button>
-    </div>
-  </div>`;
+  /* Indicador de prioridad táctica — barra superior de la card */
+  const prioBar = '<div style="display:flex;align-items:center;justify-content:space-between;' +
+    'margin-bottom:7px;padding:5px 8px;border-radius:6px;border:1px solid;' + prio.css + '">' +
+    '<span style="font-size:11px;font-weight:800;font-family:var(--mono);letter-spacing:0.5px;">' +
+      prio.ico + ' ' + prio.label +
+    '</span>' +
+    /* Días desde último contacto */
+    (function() {
+      if (!l.historial?.length) return '<span style="font-size:10px;opacity:0.7;">Sin contacto previo</span>';
+      const diasSin = Math.round((Date.now() - new Date(l.historial[l.historial.length-1].fecha).getTime()) / 86400000);
+      if (diasSin === 0) return '<span style="font-size:10px;opacity:0.7;">Contactado hoy</span>';
+      if (diasSin === 1) return '<span style="font-size:10px;opacity:0.7;">Ayer</span>';
+      return '<span style="font-size:10px;opacity:0.7;">Hace ' + diasSin + ' días</span>';
+    })() +
+  '</div>';
+
+  return '<div class="terreno-card src-' + src + (urgente?' urgente':'') + '" data-tid="' + l.id + '">' +
+    prioBar +
+    '<div class="tc-top">' +
+      '<div class="tc-name">' + esc(l.nombre) + '</div>' +
+      '<div class="tc-iut"><span class="iut-badge ' + iutCls + '">' + iutLabel(iut) + ' IUT·' + iut + '</span></div>' +
+    '</div>' +
+    '<div class="tc-meta">' +
+      '<span class="tc-dist">◈ ' + fmtDist(l._dist) + '</span>' +
+      '<span class="src-badge ' + src + '">' + srcLbl + '</span>' +
+      nivelBadge(l.nivel||'bajo') +
+    '</div>' +
+    equiposHtml +
+    notaDisplay +
+    '<div class="tc-actions-primary">' +
+      '<button class="tc-btn primary-ir" data-ta="ir">NAVEGAR</button>' +
+      (tel ? '<button class="tc-btn primary-wa" data-ta="wa">WHATSAPP</button>'
+           : '<button class="tc-btn" data-ta="abrir">VER FICHA</button>') +
+    '</div>' +
+    '<div class="tc-actions-secondary">' +
+      (tel ? '<button class="tc-btn btn-sm-ico" data-ta="llamar" title="Llamar">📞</button>' : '') +
+      '<button class="tc-btn btn-sm-ico" data-ta="visitado" title="Marcar visitado">✅</button>' +
+      '<button class="tc-btn btn-sm-ico" data-ta="nota"     title="Nota rápida">📝</button>' +
+      '<button class="tc-btn btn-sm-ico" data-ta="ruta"     title="+ Ruta">🗺️</button>' +
+      '<button class="tc-btn btn-sm-ico btn-urgente" data-ta="urgente" title="Marcar urgente">🚨</button>' +
+      '<button class="tc-btn btn-sm-ico" data-ta="abrir"    title="Editar">✏️</button>' +
+    '</div>' +
+  '</div>';
 }
 
 /* ======================================================================
@@ -2504,82 +3030,217 @@ async function buscarGoogleQuery(queryCompleto, geo) {
   return mapeados;
 }
 
+/* ======================================================================
+   SISTEMA MULTI-RUBRO
+   ======================================================================
+   El usuario puede buscar varios rubros a la vez.
+   Cada rubro genera su propio set de queries multi-zona.
+   Los resultados se acumulan y deduplicán en un solo pool.
+
+   Formas de agregar rubros:
+   1. Escribir en el campo y presionar Enter o coma
+   2. Tocar un chip de "rubros frecuentes"
+   3. Escribir múltiples separados por coma: "taller, metalurgica, soldadora"
+   ====================================================================== */
+
+let _rubrosActivos = []; /* array de strings */
+
+function actualizarChipsRubros() {
+  const chips = $('#rubros-chips');
+  const input = $('#inp-rubro');
+  if (!chips) return;
+
+  if (!_rubrosActivos.length) {
+    chips.style.display = 'none';
+    return;
+  }
+
+  chips.style.display = 'flex';
+  chips.innerHTML = _rubrosActivos.map(r =>
+    '<span style="display:inline-flex;align-items:center;gap:4px;' +
+    'background:rgba(255,107,26,0.15);border:1px solid rgba(255,107,26,0.4);' +
+    'color:var(--em-orange);border-radius:14px;padding:4px 10px;' +
+    'font-size:12px;font-weight:700;font-family:var(--sans);">' +
+    esc(r) +
+    '<button data-del-rubro="' + esc(r) + '" style="background:none;border:none;' +
+    'color:var(--em-orange);cursor:pointer;font-size:13px;padding:0;line-height:1;' +
+    'margin-left:2px;">×</button></span>'
+  ).join('');
+
+  chips.querySelectorAll('[data-del-rubro]').forEach(b => {
+    b.addEventListener('click', () => {
+      _rubrosActivos = _rubrosActivos.filter(r => r !== b.dataset.delRubro);
+      /* Desmarcar el botón sugerido si corresponde */
+      $$('#rubros-sugeridos [data-rubro]').forEach(btn => {
+        btn.classList.toggle('active', _rubrosActivos.includes(btn.dataset.rubro));
+      });
+      actualizarChipsRubros();
+    });
+  });
+
+  /* Limpiar el input cuando hay chips */
+  if (input) input.placeholder = 'Agregar más rubros...';
+}
+
+function agregarRubro(rubro) {
+  const r = rubro.trim().toLowerCase();
+  if (!r) return;
+  if (_rubrosActivos.includes(r)) return;
+  _rubrosActivos.push(r);
+  actualizarChipsRubros();
+}
+
+function parsearRubrosDelInput(valor) {
+  /* Soporta: "taller, metalurgica, soldadora" o "taller metalurgica" */
+  return valor.split(/[,;]+/)
+    .map(r => r.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+/* Inicializar listeners del sistema multi-rubro */
+function initMultiRubro() {
+  const input = $('#inp-rubro');
+  if (!input) return;
+
+  /* Enter o coma en el campo → agregar rubro */
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ',') {
+      e.preventDefault();
+      const rubros = parsearRubrosDelInput(input.value);
+      rubros.forEach(agregarRubro);
+      input.value = '';
+    }
+  });
+
+  /* Perder foco con texto → agregar como rubro */
+  input.addEventListener('blur', () => {
+    if (!input.value.trim()) return;
+    const rubros = parsearRubrosDelInput(input.value);
+    rubros.forEach(agregarRubro);
+    input.value = '';
+  });
+
+  /* Chips de rubros sugeridos */
+  $$('#rubros-sugeridos [data-rubro]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const r = btn.dataset.rubro;
+      if (_rubrosActivos.includes(r)) {
+        /* Toggle: si ya está, quitar */
+        _rubrosActivos = _rubrosActivos.filter(x => x !== r);
+        btn.classList.remove('active');
+      } else {
+        agregarRubro(r);
+        btn.classList.add('active');
+      }
+      actualizarChipsRubros();
+    });
+  });
+}
+
 /* ── Handler del botón BUSCAR ──────────────────────────────────────── */
 let buscarTodaZona = false;
 
 $('#btn-buscar').addEventListener('click', async () => {
   const ciudad = $('#inp-ciudad').value.trim();
-  const rubro  = $('#inp-rubro').value.trim();
   const fuente = $('#inp-fuente').value;
 
+  /* Recolectar rubros: chips activos + lo que haya en el input */
+  const inputVal = $('#inp-rubro').value.trim();
+  if (inputVal) {
+    parsearRubrosDelInput(inputVal).forEach(agregarRubro);
+    $('#inp-rubro').value = '';
+  }
+
+  /* Si no hay chips ni input, usar el valor del input directamente */
+  let rubros = [..._rubrosActivos];
+  if (!rubros.length && inputVal) rubros = parsearRubrosDelInput(inputVal);
+  if (!rubros.length) { toast('Ingresá al menos un rubro'); return; }
   if (!ciudad && !buscarTodaZona) { toast('Ingresá una ciudad'); return; }
-  if (!rubro)                     { toast('Ingresá el tipo de negocio'); return; }
 
   const ciudades = buscarTodaZona ? CIUDADES_ZONA : [ciudad];
   const info     = $('#buscar-info');
   const cont     = $('#resultados-buscar');
 
-  info.innerHTML = '<span class="spinner"></span> Iniciando radar...';
+  /* Resumen de lo que se va a buscar */
+  const totalCombinaciones = ciudades.length * rubros.length;
+  info.innerHTML =
+    '<span class="spinner"></span> Iniciando radar · ' +
+    '<b>' + rubros.length + '</b> rubro(s) × ' +
+    '<b>' + ciudades.length + '</b> ciudad(es) = ' +
+    '<b>' + totalCombinaciones + '</b> campañas...';
+
   $('#btn-buscar').disabled = true;
   cont.innerHTML = '';
   state.resultados = [];
+  _filtrarYaGuardados = false;
 
-  const tsInicio = Date.now();
-  let totalEncontrados = 0;
+  const tsInicio     = Date.now();
+  const idsGlobales  = new Set();
+  let rubroActual    = 0;
 
-  for (const c of ciudades) {
-    try {
-      const resultados = await buscarMultiZona(c, rubro, fuente, (prog) => {
-        /* Progreso en tiempo real */
-        const elapsed  = Math.round((Date.now() - tsInicio) / 1000);
-        const restante = prog.total > 0
-          ? Math.round((elapsed / prog.consulta) * (prog.total - prog.consulta))
-          : 0;
+  for (const rubro of rubros) {
+    rubroActual++;
+    for (const c of ciudades) {
+      try {
+        const parciales = await buscarMultiZona(c, rubro, fuente, (prog) => {
+          const elapsed  = Math.round((Date.now() - tsInicio) / 1000);
+          const restante = prog.total > 0 && prog.consulta > 0
+            ? Math.round((elapsed / prog.consulta) * (prog.total - prog.consulta))
+            : 0;
 
-        info.innerHTML =
-          '<span class="spinner" style="width:10px;height:10px;border-width:1px;vertical-align:middle;margin-right:5px;"></span>' +
-          '<b>' + esc(c) + '</b> · Zona ' + prog.consulta + '/' + prog.total +
-          ' · <b style="color:var(--accent);">' + (prog.encontrados + totalEncontrados) + '</b> únicos' +
-          (restante > 0 ? ' · ~' + restante + 's restantes' : '') +
-          '<br><span style="font-size:10px;font-family:var(--mono);color:var(--text-dim);">→ ' + esc(prog.query) + '</span>';
-      });
+          info.innerHTML =
+            '<span class="spinner" style="width:10px;height:10px;border-width:1px;' +
+            'vertical-align:middle;margin-right:5px;"></span>' +
+            '<b style="color:var(--em-orange);">' + esc(rubro) + '</b>' +
+            ' (' + rubroActual + '/' + rubros.length + ')' +
+            ' · <b>' + esc(c) + '</b>' +
+            ' · Zona ' + prog.consulta + '/' + prog.total +
+            ' · <b style="color:var(--accent);">' + state.resultados.length + '</b> únicos' +
+            (restante > 0 ? ' · ~' + restante + 's' : '') +
+            '<br><span style="font-size:10px;font-family:var(--mono);color:var(--text-dim);">' +
+            '→ ' + esc(prog.query) + '</span>';
+        });
 
-      /* Calcular IUT y agregar a resultados globales */
-      resultados.forEach(r => {
-        r.iut = calcularIUT({ ...r, equipos: [], tags: [] });
-      });
-      resultados.sort((a, b) => b.iut - a.iut || (b.rating || 0) - (a.rating || 0));
+        /* Calcular IUT y deduplicar globalmente */
+        parciales.forEach(r => {
+          r.iut  = calcularIUT({ ...r, equipos: [], tags: [] });
+          r.rubro = r.rubro || detectarRubro(rubro);
+        });
 
-      /* Agregar sin duplicar con lo ya encontrado en ciudades anteriores */
-      const idsExistentes = new Set(state.resultados.map(r => r.googleId || r.osmId).filter(Boolean));
-      const nuevos = resultados.filter(r => {
-        const id = r.googleId || r.osmId;
-        if (id && idsExistentes.has(id)) return false;
-        if (id) idsExistentes.add(id);
-        return true;
-      });
+        const nuevos = parciales.filter(r => {
+          const id = r.googleId || r.osmId;
+          if (id && idsGlobales.has(id)) return false;
+          /* Fallback: deduplicar por nombre+dirección */
+          const k = normalizar(r.nombre) + '|' + normalizar(r.direccion || '').slice(0, 20);
+          if (idsGlobales.has(k)) return false;
+          if (id) idsGlobales.add(id);
+          idsGlobales.add(k);
+          return true;
+        });
 
-      state.resultados = state.resultados.concat(nuevos);
-      totalEncontrados = state.resultados.length;
+        state.resultados = state.resultados.concat(nuevos);
+        state.resultados.sort((a, b) => b.iut - a.iut || (b.rating || 0) - (a.rating || 0));
 
-      /* Render incremental — mostrar lo que hay sin esperar el resto */
-      renderResultados(state.resultados);
-      renderMapResults(state.resultados);
+        /* Render incremental después de cada rubro+ciudad */
+        renderResultados(state.resultados);
+        renderMapResults(state.resultados);
 
-    } catch(e) {
-      console.warn('[Buscar]', c, e.message);
+      } catch(e) {
+        console.warn('[Buscar]', rubro, c, e.message);
+      }
     }
   }
 
-  /* Resultado final */
+  /* Resumen final */
   const elapsed = Math.round((Date.now() - tsInicio) / 1000);
   if (state.resultados.length) {
     info.innerHTML =
-      '<b style="color:var(--accent);">' + state.resultados.length + '</b> objetivos únicos encontrados' +
-      ' · ' + elapsed + 's · ' +
-      (fuente === 'google' ? 'Google Places' : 'OpenStreetMap');
+      '✓ <b style="color:var(--accent);">' + state.resultados.length + '</b> objetivos únicos' +
+      ' · <b>' + rubros.length + '</b> rubro(s)' +
+      ' · ' + elapsed + 's' +
+      ' · ' + (fuente === 'google' ? 'Google' : 'OSM');
   } else {
-    info.textContent = 'Sin resultados. Probá con otro rubro o ciudad.';
+    info.textContent = 'Sin resultados. Probá con otros rubros o ciudad.';
   }
 
   /* Enriquecer teléfonos en background */
@@ -2590,54 +3251,143 @@ $('#btn-buscar').addEventListener('click', async () => {
   $('#btn-buscar').disabled = false;
 });
 
+/* Estado del filtro de resultados */
+let _filtrarYaGuardados = false;
+
+function getResultadosFiltrados() {
+  if (!_filtrarYaGuardados) return state.resultados;
+  return state.resultados.filter(r => !encontrarLeadExistente(r));
+}
+
+function renderBotonesAccionMasiva() {
+  const total   = state.resultados.length;
+  const nuevos  = state.resultados.filter(r => !encontrarLeadExistente(r)).length;
+  const ya      = total - nuevos;
+
+  const barra = $('#barra-acciones-resultados');
+  if (!barra) return;
+
+  barra.style.display = total ? 'flex' : 'none';
+  barra.innerHTML =
+    /* Contador */
+    '<div style="display:flex;align-items:center;gap:6px;flex:1;min-width:0;">' +
+      '<span style="font-family:var(--mono);font-size:11px;color:var(--text-dim);">' +
+        '<b style="color:var(--accent);">' + nuevos + '</b> nuevos · ' +
+        '<b style="color:var(--text-dim);">' + ya + '</b> ya guardados' +
+      '</span>' +
+    '</div>' +
+    /* Toggle ocultar ya guardados */
+    '<button id="btn-toggle-ya-guardados" class="btn btn-sm' + (_filtrarYaGuardados ? ' btn-g' : '') + '" ' +
+      'style="flex-shrink:0;font-size:11px;padding:6px 10px;">' +
+      (_filtrarYaGuardados ? '✓ Solo nuevos' : 'Solo nuevos') +
+    '</button>' +
+    /* Guardar todos los nuevos */
+    '<button id="btn-guardar-todos" class="btn btn-em btn-sm" ' +
+      'style="flex-shrink:0;font-size:11px;padding:6px 10px;" ' +
+      (nuevos === 0 ? 'disabled style="opacity:0.4;"' : '') + '>' +
+      '⬇ GUARDAR ' + nuevos +
+    '</button>';
+
+  /* Toggle filtro */
+  $('#btn-toggle-ya-guardados').addEventListener('click', () => {
+    _filtrarYaGuardados = !_filtrarYaGuardados;
+    renderBotonesAccionMasiva();
+    renderResultados(state.resultados);
+  });
+
+  /* Guardar todos los nuevos */
+  $('#btn-guardar-todos').addEventListener('click', async () => {
+    const btn    = $('#btn-guardar-todos');
+    const nuevos = state.resultados.filter(r => !encontrarLeadExistente(r));
+    if (!nuevos.length) return;
+
+    btn.disabled   = true;
+    btn.textContent = '⏳ Guardando...';
+
+    let guardados = 0;
+    for (const n of nuevos) {
+      const lead = crearLeadDesdeResultado(n);
+      await dbSaveLead(lead);
+      if (lead.lat && lead.lon && state.mapLeadsVisible) {
+        const m = L.marker([lead.lat, lead.lon], { icon: createLeadIcon(lead) })
+          .addTo(map)
+          .on('click', () => { expandPanel(); setTab('leads'); setTimeout(() => abrirModalLead(lead.id), 200); });
+        _leadMarkersMap.set(lead.id, m);
+      }
+      guardados++;
+      /* Actualizar contador cada 5 para no bloquear UI */
+      if (guardados % 5 === 0) {
+        btn.textContent = '⏳ ' + guardados + '/' + nuevos.length;
+        await new Promise(res => setTimeout(res, 0));
+      }
+    }
+
+    toast('✓ ' + guardados + ' leads guardados');
+    renderBotonesAccionMasiva();
+    renderResultados(state.resultados);
+
+    /* Enriquecer teléfonos de los recién guardados */
+    if (nuevos.some(r => r.fuente === 'google')) {
+      setTimeout(() => lanzarEnriquecimiento(nuevos), 500);
+    }
+  });
+}
+
 function renderResultados(lista) {
   const cont = $('#resultados-buscar');
-  if (!lista.length) {
-    cont.innerHTML = '<div class="empty-state"><span class="ico">🔍</span>Sin resultados.</div>';
+
+  /* Actualizar barra de acciones */
+  renderBotonesAccionMasiva();
+
+  /* Aplicar filtro de ya guardados */
+  const listaFiltrada = _filtrarYaGuardados
+    ? lista.filter(r => !encontrarLeadExistente(r))
+    : lista;
+
+  if (!listaFiltrada.length) {
+    cont.innerHTML = _filtrarYaGuardados
+      ? '<div class="empty-state"><span class="ico">✅</span>Todos los resultados ya están guardados.</div>'
+      : '<div class="empty-state"><span class="ico">🔍</span>Sin resultados.</div>';
     return;
   }
 
-  cont.innerHTML = lista.map((n, i) => {
+  /* Guardar _idx */
+  lista.forEach((n, i) => { n._idx = i; });
+
+  cont.innerHTML = listaFiltrada.map((n, i) => {
     const tel    = !!(n.telefono && limpiarTel(n.telefono).length >= 6);
     const yaLead = !!encontrarLeadExistente(n);
     const src    = n.fuente === 'google' ? 'g' : 'osm';
     const iut    = n.iut || 0;
-    const gid    = n.googleId ? `data-google-id="${esc(n.googleId)}"` : '';
+    const gid    = n.googleId ? 'data-google-id="' + esc(n.googleId) + '"' : '';
 
-    /* Slot de teléfono:
-       - Si ya tenemos el teléfono (cache hit) → mostrarlo
-       - Si es Google y no tenemos → spinner pequeño mientras llega
-       - Si es OSM sin teléfono → "Sin teléfono" */
     let telHtml;
     if (tel) {
-      telHtml = `<div class="rc-meta rc-tel-slot">📞 <strong>${esc(n.telefono)}</strong></div>`;
+      telHtml = '<div class="rc-meta rc-tel-slot">📞 <strong>' + esc(n.telefono) + '</strong></div>';
     } else if (n.fuente === 'google' && n.googleId) {
-      telHtml = `<div class="rc-meta rc-tel-slot muted"><span class="spinner" style="width:10px;height:10px;border-width:1px;vertical-align:middle;margin-right:4px;"></span>Cargando teléfono...</div>`;
+      telHtml = '<div class="rc-meta rc-tel-slot muted"><span class="spinner" style="width:10px;height:10px;border-width:1px;vertical-align:middle;margin-right:4px;"></span>Cargando...</div>';
     } else {
-      telHtml = `<div class="rc-meta rc-tel-slot muted">Sin teléfono detectado</div>`;
+      telHtml = '<div class="rc-meta rc-tel-slot muted">Sin teléfono</div>';
     }
 
-    return `
-    <div class="result-card src-${src}" ${gid}>
-      <div class="rc-header">
-        <div class="rc-name">${esc(n.nombre)} <span class="iut-badge ${iutClase(iut)}" style="font-size:9px;">${iutLabel(iut)}${iut}</span></div>
-        <div style="text-align:right;">${n.rating ? `<div style="color:var(--yellow);font-size:11px;">★ ${n.rating}</div>` : ''}</div>
-      </div>
-      ${n.direccion ? `<div class="rc-meta">📍 ${esc(n.direccion)}</div>` : ''}
-      ${telHtml}
-      ${n.tipo ? `<div class="rc-meta muted">${esc(n.tipo)}</div>` : ''}
-      <div class="rc-actions">
-        <button class="btn btn-sm" data-rc-maps="${i}">MAPS</button>
-        ${tel ? `<button class="btn btn-sm btn-b rc-wa-btn" data-rc-wa="${i}">WA</button>` : ''}
-        <button class="btn btn-sm ${yaLead ? '' : 'btn-em'}" data-rc-add="${i}" ${yaLead ? 'disabled style="opacity:0.5;"' : ''}>
-          ${yaLead ? '✓ GUARDADO' : '+ GUARDAR'}
-        </button>
-      </div>
-    </div>`;
+    return '<div class="result-card src-' + src + '" ' + gid + '>' +
+      '<div class="rc-header">' +
+        '<div class="rc-name">' + esc(n.nombre) + ' <span class="iut-badge ' + iutClase(iut) + '" style="font-size:9px;">' + iutLabel(iut) + iut + '</span></div>' +
+        (n.rating ? '<div style="color:var(--yellow);font-size:11px;">★ ' + n.rating + '</div>' : '') +
+      '</div>' +
+      (n.direccion ? '<div class="rc-meta">📍 ' + esc(n.direccion) + '</div>' : '') +
+      telHtml +
+      (n.tipo ? '<div class="rc-meta muted">' + esc(n.tipo) + '</div>' : '') +
+      '<div class="rc-actions">' +
+        '<button class="btn btn-sm" data-rc-maps="' + n._idx + '">MAPS</button>' +
+        (tel ? '<button class="btn btn-sm btn-b rc-wa-btn" data-rc-wa="' + n._idx + '">WA</button>' : '') +
+        '<button class="btn btn-sm ' + (yaLead ? '' : 'btn-em') + '" data-rc-add="' + n._idx + '" ' +
+          (yaLead ? 'disabled style="opacity:0.5;"' : '') + '>' +
+          (yaLead ? '✓ GUARDADO' : '+ GUARDAR') +
+        '</button>' +
+      '</div>' +
+    '</div>';
   }).join('');
-
-  /* Guardar _idx en cada resultado para referencia posterior */
-  lista.forEach((n, i) => { n._idx = i; });
 
   cont.querySelectorAll('[data-rc-maps]').forEach(b =>
     b.addEventListener('click', () => abrirMaps(state.resultados[+b.dataset.rcMaps])));
@@ -2655,9 +3405,10 @@ function renderResultados(lista) {
         _leadMarkersMap.set(lead.id, m);
       }
       b.textContent = '✓ GUARDADO';
-      b.disabled = true;
+      b.disabled    = true;
       b.classList.remove('btn-em');
-      toast('✓ Lead guardado con teléfono');
+      renderBotonesAccionMasiva();
+      toast('✓ Lead guardado');
     });
   });
 
@@ -2665,10 +3416,7 @@ function renderResultados(lista) {
     b.addEventListener('click', async () => {
       const n = state.resultados[+b.dataset.rcWa];
       let lead = encontrarLeadExistente(n);
-      if (!lead) {
-        lead = crearLeadDesdeResultado(n);
-        await dbSaveLead(lead);
-      }
+      if (!lead) { lead = crearLeadDesdeResultado(n); await dbSaveLead(lead); }
       abrirWhatsApp(lead, 'primero');
     });
   });
@@ -2907,22 +3655,182 @@ function iniciarRecorrido() {
   window.open(url, '_blank');
 }
 
+/* ======================================================================
+   MODO ARRANCAR DÍA
+   ======================================================================
+   Sugiere automáticamente los mejores objetivos del día basándose en:
+
+   CRITERIOS DE SELECCIÓN (score compuesto):
+   1. Seguimiento vencido hoy o atrasado        → +100 pts
+   2. IUT alto (urgencia técnica)               → hasta +80 pts
+   3. Estado urgente                            → +60 pts
+   4. Nunca contactado con teléfono disponible  → +40 pts
+   5. Cliente/recurrente (revisita productiva)  → +35 pts
+   6. Proximidad GPS (radio 5km)                → hasta +30 pts
+   7. Presupuesto enviado sin respuesta         → +25 pts
+   8. Sin contacto hace más de 7 días           → +20 pts
+
+   Devuelve hasta 8 objetivos ordenados y optimiza la ruta por cercanía.
+   ====================================================================== */
+
+function calcularScoreDia(lead, userLat, userLon) {
+  let score = 0;
+  const ahora = Date.now();
+
+  /* Seguimiento vencido — máxima prioridad */
+  if (lead.seguimientoFecha) {
+    const diff = ahora - new Date(lead.seguimientoFecha).getTime();
+    if (diff >= 0) score += 100; /* hoy o atrasado */
+  }
+
+  /* IUT */
+  const iut = calcularIUT(lead);
+  score += Math.round(iut * 0.8);
+
+  /* Estado */
+  if (lead.estado === 'urgente')       score += 60;
+  if (lead.estado === 'presupuesto')   score += 25;
+  if (lead.estado === 'esperando')     score += 20;
+  if (['cliente','recurrente','mantenimiento'].includes(lead.estado)) score += 35;
+
+  /* Sin contacto nunca + tiene teléfono */
+  if (lead.estado === 'no-contactado' && lead.telefono &&
+      limpiarTel(lead.telefono).length >= 6) score += 40;
+
+  /* Días desde último contacto */
+  if (lead.historial?.length) {
+    const ultimo = new Date(lead.historial[lead.historial.length-1].fecha).getTime();
+    const diasSin = (ahora - ultimo) / 86400000;
+    if (diasSin > 7)  score += 20;
+    if (diasSin > 30) score += 15;
+  } else {
+    score += 20; /* sin historial = nunca tocado */
+  }
+
+  /* Proximidad GPS */
+  if (userLat && lead.lat && lead.lon) {
+    const dist = distKm(userLat, userLon, lead.lat, lead.lon);
+    if (dist <= 5) score += Math.round((1 - dist/5) * 30);
+  }
+
+  return score;
+}
+
+function generarObjetivosDia(max) {
+  max = max || 8;
+  const userLat = state.userLat;
+  const userLon = state.userLon;
+
+  return state.leads
+    .filter(l => l.lat && l.lon && !['descartado'].includes(l.estado))
+    .map(l => ({ ...l, _scoreDia: calcularScoreDia(l, userLat, userLon) }))
+    .sort((a, b) => b._scoreDia - a._scoreDia)
+    .slice(0, max);
+}
+
+function renderArrancarDia() {
+  const panel = $('#panel-arrancar-dia');
+  if (!panel) return;
+  panel.style.display = 'block';
+
+  /* Resumen del día */
+  const ahora       = Date.now();
+  const seguHoy     = state.leads.filter(l =>
+    l.seguimientoFecha && new Date(l.seguimientoFecha).getTime() <= ahora &&
+    !['descartado'].includes(l.estado)
+  ).length;
+  const urgentes    = state.leads.filter(l => l.estado === 'urgente').length;
+  const sinContacto = state.leads.filter(l =>
+    l.estado === 'no-contactado' && l.telefono &&
+    limpiarTel(l.telefono).length >= 6
+  ).length;
+
+  $('#dia-resumen').innerHTML =
+    '<div class="z-stat"><b style="color:var(--em-orange);">' + seguHoy + '</b>seguim. hoy</div>' +
+    '<div class="z-stat"><b style="color:var(--red);">' + urgentes + '</b>urgentes</div>' +
+    '<div class="z-stat"><b style="color:var(--accent);">' + sinContacto + '</b>sin contactar</div>';
+
+  /* Objetivos sugeridos */
+  const objetivos = generarObjetivosDia(8);
+  const cont      = $('#dia-objetivos');
+
+  if (!objetivos.length) {
+    cont.innerHTML = '<div class="muted" style="font-size:12px;text-align:center;padding:8px;">Sin leads con coordenadas todavía.</div>';
+    return;
+  }
+
+  cont.innerHTML = objetivos.map(l => {
+    const iut      = calcularIUT(l);
+    const dist     = state.userLat ? distKm(state.userLat, state.userLon, l.lat, l.lon) : null;
+    const seguHoy2 = l.seguimientoFecha &&
+      new Date(l.seguimientoFecha).getTime() <= ahora;
+
+    /* Motivo principal */
+    let motivo = '';
+    if (seguHoy2)                       motivo = '⏰ Seguimiento hoy';
+    else if (l.estado === 'urgente')    motivo = '🚨 Urgente';
+    else if (l.estado === 'presupuesto') motivo = '💰 Presupuesto pendiente';
+    else if (l.estado === 'no-contactado') motivo = '📞 Sin contactar';
+    else if (['cliente','recurrente','mantenimiento'].includes(l.estado))
+                                         motivo = '⭐ Cliente — revisita';
+    else motivo = '🎯 IUT ' + iut;
+
+    return '<div style="display:flex;align-items:center;gap:8px;padding:7px 0;' +
+      'border-bottom:1px solid var(--border);">' +
+      '<div style="flex:1;min-width:0;">' +
+        '<div style="font-size:13px;font-weight:800;white-space:nowrap;' +
+          'overflow:hidden;text-overflow:ellipsis;">' + esc(l.nombre) + '</div>' +
+        '<div style="font-size:11px;color:var(--text-dim);">' +
+          motivo +
+          (dist !== null ? ' · ' + fmtDist(dist) : '') +
+        '</div>' +
+      '</div>' +
+      '<span class="iut-badge ' + iutClase(iut) + '" style="font-size:9px;flex-shrink:0;">' +
+        iutLabel(iut) + iut +
+      '</span>' +
+    '</div>';
+  }).join('');
+
+  /* Guardar los objetivos como ruta */
+  panel._objetivos = objetivos;
+}
+
 $('#btn-ir-hoy').addEventListener('click', () => {
   if (!state.userLat) { toast('Activá GPS primero'); return; }
-  const candidatos = state.leads
-    .filter(l => l.lat && l.lon && !['descartado','cliente-ok'].includes(l.estado))
-    .map(l => ({ ...l, _dist:distKm(state.userLat,state.userLon,l.lat,l.lon), _iut:calcularIUT(l) }))
-    .sort((a,b) => (b._iut-a._iut)||(a._dist-b._dist))
-    .slice(0, 6);
-  if (!candidatos.length) { toast('No hay leads con coordenadas'); return; }
-  const rutaSug = optimizarRuta(
-    candidatos.map(l => ({ id:uid(), leadId:l.id, nombre:l.nombre, direccion:l.direccion, lat:l.lat, lon:l.lon })),
+  if (!state.leads.filter(l => l.lat && l.lon).length) {
+    toast('Sin leads con coordenadas todavía'); return;
+  }
+  renderArrancarDia();
+  /* Scroll al panel */
+  $('#panel-arrancar-dia').scrollIntoView({ behavior: 'smooth', block: 'start' });
+});
+
+$('#btn-cerrar-arrancar').addEventListener('click', () => {
+  $('#panel-arrancar-dia').style.display = 'none';
+});
+
+$('#btn-dia-regenerar').addEventListener('click', () => {
+  renderArrancarDia();
+  toast('Objetivos regenerados');
+});
+
+$('#btn-dia-iniciar').addEventListener('click', () => {
+  const panel    = $('#panel-arrancar-dia');
+  const objetivos = panel?._objetivos;
+  if (!objetivos?.length) { toast('Sin objetivos generados'); return; }
+
+  const rutaOpt = optimizarRuta(
+    objetivos.map(l => ({
+      id: uid(), leadId: l.id, nombre: l.nombre,
+      direccion: l.direccion, lat: l.lat, lon: l.lon
+    })),
     state.userLat, state.userLon
   );
-  state.ruta = rutaSug;
+  state.ruta = rutaOpt;
   saveRuta();
+  panel.style.display = 'none';
   setTab('ruta');
-  toast(`Ruta creada: ${candidatos.length} objetivos optimizados`);
+  toast('✓ Ruta del día: ' + objetivos.length + ' objetivos optimizados');
 });
 
 $('#btn-add-manual-ruta').addEventListener('click', () => {
@@ -3103,47 +4011,214 @@ $('#btn-recalc-zonas').addEventListener('click', () => { zonasEstado.detalleId=n
 /* ======================================================================
    26. STATS
    ====================================================================== */
+/* ── Helpers para stats de conversión ─────────────────────────────── */
+function calcularConversionPorRubro() {
+  const rubros = {};
+  for (const l of state.leads) {
+    if (l.estado === 'descartado') continue;
+    const r = l.rubro || detectarRubro(l.tipo || '');
+    if (!rubros[r]) rubros[r] = { total:0, contactados:0, clientes:0 };
+    rubros[r].total++;
+    if (l.estado !== 'no-contactado') rubros[r].contactados++;
+    if (['cliente','recurrente','mantenimiento'].includes(l.estado)) rubros[r].clientes++;
+  }
+  return Object.entries(rubros)
+    .map(([rubro, d]) => ({
+      rubro,
+      ...d,
+      tasaContacto:  d.total > 0 ? Math.round((d.contactados / d.total) * 100) : 0,
+      tasaCliente:   d.contactados > 0 ? Math.round((d.clientes / d.contactados) * 100) : 0
+    }))
+    .sort((a, b) => b.clientes - a.clientes || b.total - a.total);
+}
+
+function calcularRevisitasPendientes() {
+  const ahora = Date.now();
+  const pendientes = [];
+
+  for (const l of state.leads) {
+    if (['descartado'].includes(l.estado)) continue;
+
+    /* Revisita por ciclo de mantenimiento */
+    if (l.cicloMantenimiento && l.historial?.length) {
+      const ultimoContacto = l.historial
+        .filter(h => h.accion && (h.accion.includes('WhatsApp') || h.accion.includes('visitado') || h.accion.includes('cliente')))
+        .sort((a,b) => new Date(b.fecha) - new Date(a.fecha))[0];
+
+      if (ultimoContacto) {
+        const fechaProxima = new Date(ultimoContacto.fecha);
+        fechaProxima.setMonth(fechaProxima.getMonth() + l.cicloMantenimiento);
+        const diasHasta = Math.round((fechaProxima.getTime() - ahora) / 86400000);
+
+        if (diasHasta <= 30) { /* próximos 30 días */
+          pendientes.push({
+            lead:      l,
+            tipo:      'mantenimiento',
+            diasHasta,
+            fecha:     fechaProxima,
+            motivo:    'Ciclo de mantenimiento cada ' + l.cicloMantenimiento + ' mes(es)'
+          });
+        }
+        continue;
+      }
+    }
+
+    /* Revisita por seguimiento configurado */
+    if (l.seguimientoFecha) {
+      const diasHasta = Math.round((new Date(l.seguimientoFecha).getTime() - ahora) / 86400000);
+      if (diasHasta >= 0 && diasHasta <= 14) {
+        pendientes.push({
+          lead:      l,
+          tipo:      'seguimiento',
+          diasHasta,
+          fecha:     new Date(l.seguimientoFecha),
+          motivo:    'Seguimiento programado'
+        });
+      }
+    }
+
+    /* Clientes sin visitar hace más del ciclo esperado por rubro */
+    if (['cliente','recurrente'].includes(l.estado) && l.historial?.length) {
+      const ultimo = l.historial[l.historial.length - 1];
+      const diasSin = Math.round((ahora - new Date(ultimo.fecha).getTime()) / 86400000);
+      if (diasSin > 45 && !l.seguimientoFecha) {
+        pendientes.push({
+          lead:      l,
+          tipo:      'cliente-inactivo',
+          diasHasta: -diasSin, /* negativo = hace N días */
+          fecha:     new Date(ultimo.fecha),
+          motivo:    'Cliente sin contacto hace ' + diasSin + ' días'
+        });
+      }
+    }
+  }
+
+  return pendientes.sort((a, b) => a.diasHasta - b.diasHasta);
+}
+
 async function renderStats() {
-  const t          = state.leads;
-  const total      = t.length;
-  const contactados= t.filter(l=>l.estado!=='no-contactado'&&l.estado!=='descartado').length;
-  const respondio  = t.filter(l=>['respondio','presupuesto','esperando'].includes(l.estado)).length;
-  const clientes   = t.filter(l=>['cliente','recurrente','mantenimiento'].includes(l.estado)).length;
-  const urgentes   = t.filter(l=>l.estado==='urgente').length;
-  const conFotos   = t.filter(l=>(l.fotos||[]).length>0).length;
-  const pendSeg    = t.filter(l=>l.seguimientoFecha&&esHoyOAtrasado(l.seguimientoFecha)&&l.estado!=='descartado').length;
+  const t            = state.leads;
+  const total        = t.length;
+  const contactados  = t.filter(l=>l.estado!=='no-contactado'&&l.estado!=='descartado').length;
+  const respondio    = t.filter(l=>['respondio','presupuesto','esperando'].includes(l.estado)).length;
+  const clientes     = t.filter(l=>['cliente','recurrente','mantenimiento'].includes(l.estado)).length;
+  const urgentes     = t.filter(l=>l.estado==='urgente').length;
+  const conFotos     = t.filter(l=>(l.fotos||[]).length>0).length;
+  const pendSeg      = t.filter(l=>l.seguimientoFecha&&esHoyOAtrasado(l.seguimientoFecha)&&l.estado!=='descartado').length;
   const estrategicos = t.filter(l=>l.nivel==='estrategico').length;
 
-  $('#stats-grid').innerHTML = `
-    <div class="stat-card"><div class="stat-num">${total}</div><div class="stat-label">TOTAL LEADS</div></div>
-    <div class="stat-card"><div class="stat-num">${contactados}</div><div class="stat-label">CONTACTADOS</div></div>
-    <div class="stat-card"><div class="stat-num">${respondio}</div><div class="stat-label">RESPONDIERON</div></div>
-    <div class="stat-card"><div class="stat-num" style="color:var(--em-orange);">${clientes}</div><div class="stat-label">CLIENTES</div></div>
-    <div class="stat-card"><div class="stat-num" style="color:var(--red);">${urgentes}</div><div class="stat-label">URGENTES</div></div>
-    <div class="stat-card"><div class="stat-num" style="color:var(--em-orange);">${estrategicos}</div><div class="stat-label">ESTRATÉGICOS</div></div>
-    <div class="stat-card"><div class="stat-num" style="color:var(--orange);">${pendSeg}</div><div class="stat-label">SEGUIM. HOY</div></div>
-    <div class="stat-card"><div class="stat-num" style="color:var(--blue);">${conFotos}</div><div class="stat-label">CON FOTOS</div></div>
-  `;
+  $('#stats-grid').innerHTML =
+    '<div class="stat-card"><div class="stat-num">' + total + '</div><div class="stat-label">TOTAL LEADS</div></div>' +
+    '<div class="stat-card"><div class="stat-num">' + contactados + '</div><div class="stat-label">CONTACTADOS</div></div>' +
+    '<div class="stat-card"><div class="stat-num">' + respondio + '</div><div class="stat-label">RESPONDIERON</div></div>' +
+    '<div class="stat-card"><div class="stat-num" style="color:var(--em-orange);">' + clientes + '</div><div class="stat-label">CLIENTES</div></div>' +
+    '<div class="stat-card"><div class="stat-num" style="color:var(--red);">' + urgentes + '</div><div class="stat-label">URGENTES</div></div>' +
+    '<div class="stat-card"><div class="stat-num" style="color:var(--em-orange);">' + estrategicos + '</div><div class="stat-label">ESTRATÉGICOS</div></div>' +
+    '<div class="stat-card"><div class="stat-num" style="color:var(--orange);">' + pendSeg + '</div><div class="stat-label">SEGUIM. HOY</div></div>' +
+    '<div class="stat-card"><div class="stat-num" style="color:var(--blue);">' + conFotos + '</div><div class="stat-label">CON FOTOS</div></div>';
 
-  const equiposFreq = {};
+  /* Equipos más detectados */
+  const equiposFreq  = {};
   t.forEach(l => (l.equipos||[]).forEach(e => { equiposFreq[e]=(equiposFreq[e]||0)+1; }));
   const equiposOrden = Object.entries(equiposFreq).sort((a,b)=>b[1]-a[1]).slice(0,6);
-  const maxEq = equiposOrden[0]?.[1] || 1;
+  const maxEq        = equiposOrden[0]?.[1] || 1;
 
   $('#stats-equipos').innerHTML = equiposOrden.length
     ? equiposOrden.map(([eid,cnt]) => {
         const eq  = EQUIPOS_CATALOGO.find(x=>x.id===eid) || { ico:'📦', label:eid.toUpperCase() };
         const pct = Math.round((cnt/maxEq)*100);
-        return `
-        <div style="margin-bottom:6px;">
-          <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;">
-            <span style="font-weight:700;">${eq.ico} ${eq.label}</span>
-            <span style="font-family:var(--mono);color:var(--em-orange);">${cnt}</span>
-          </div>
-          <div class="iut-bar"><div class="iut-bar-fill" style="width:${pct}%;background:var(--em-orange);"></div></div>
-        </div>`;
+        return '<div style="margin-bottom:6px;">' +
+          '<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;">' +
+            '<span style="font-weight:700;">' + eq.ico + ' ' + eq.label + '</span>' +
+            '<span style="font-family:var(--mono);color:var(--em-orange);">' + cnt + '</span>' +
+          '</div>' +
+          '<div class="iut-bar"><div class="iut-bar-fill" style="width:' + pct + '%;background:var(--em-orange);"></div></div>' +
+        '</div>';
       }).join('')
     : '<div class="muted">Agregá equipos a los leads para ver estadísticas.</div>';
+
+  /* ── MEJORA 7: Conversiones por rubro ─────────────────────────────── */
+  const conversiones = calcularConversionPorRubro();
+  const contConv     = $('#stats-conversiones');
+  if (contConv) {
+    if (!conversiones.length) {
+      contConv.innerHTML = '<div class="muted">Sin datos suficientes todavía.</div>';
+    } else {
+      const maxClientes = conversiones[0]?.clientes || 1;
+      contConv.innerHTML = conversiones.slice(0,6).map(c => {
+        const pct = Math.round((c.clientes / Math.max(maxClientes,1)) * 100);
+        return '<div style="margin-bottom:8px;background:var(--bg-panel);border:1px solid var(--border);' +
+          'border-radius:var(--r);padding:9px 10px;">' +
+          '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">' +
+            '<span style="font-size:12px;font-weight:800;text-transform:capitalize;">' + esc(c.rubro) + '</span>' +
+            '<div style="display:flex;gap:6px;font-family:var(--mono);font-size:10px;">' +
+              '<span style="color:var(--text-dim);">' + c.total + ' leads</span>' +
+              '<span style="color:var(--blue);">' + c.tasaContacto + '% contactado</span>' +
+              '<span style="color:var(--accent);font-weight:700;">' + c.clientes + ' clientes</span>' +
+            '</div>' +
+          '</div>' +
+          /* Barra doble: contactados (azul) + clientes (naranja) */
+          '<div style="height:6px;background:var(--bg-raised);border-radius:3px;overflow:hidden;">' +
+            '<div style="height:100%;width:' + c.tasaContacto + '%;background:var(--blue);border-radius:3px;position:relative;">' +
+              '<div style="position:absolute;top:0;left:0;height:100%;width:' + c.tasaCliente + '%;background:var(--em-orange);border-radius:3px;"></div>' +
+            '</div>' +
+          '</div>' +
+          '<div style="font-size:9px;color:var(--text-dim);margin-top:3px;font-family:var(--mono);">' +
+            '■ <span style="color:var(--blue);">contactado</span> ' +
+            '■ <span style="color:var(--em-orange);">cliente (' + c.tasaCliente + '% conv.)</span>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+    }
+  }
+
+  /* ── MEJORA 8: Alertas de revisita inteligente ─────────────────────── */
+  const revisitas  = calcularRevisitasPendientes();
+  const contRevis  = $('#stats-revisitas');
+  if (contRevis) {
+    if (!revisitas.length) {
+      contRevis.innerHTML = '<div class="muted" style="font-size:12px;">' +
+        'Sin revisitas pendientes en los próximos 30 días. ✓</div>';
+    } else {
+      contRevis.innerHTML = revisitas.slice(0,8).map(r => {
+        const l        = r.lead;
+        const esHoy    = r.diasHasta === 0;
+        const esAtras  = r.diasHasta < 0;
+        const esPronto = r.diasHasta > 0 && r.diasHasta <= 7;
+
+        let colorBg, colorTxt, textoFecha;
+        if (esAtras)      { colorBg='rgba(255,51,85,0.1)';    colorTxt='var(--red)';      textoFecha='Hace ' + Math.abs(r.diasHasta) + ' días'; }
+        else if (esHoy)   { colorBg='rgba(255,107,26,0.12)';  colorTxt='var(--em-orange)'; textoFecha='HOY'; }
+        else if (esPronto){ colorBg='rgba(245,196,0,0.1)';    colorTxt='var(--yellow)';   textoFecha='En ' + r.diasHasta + ' días'; }
+        else               { colorBg='rgba(45,143,255,0.08)'; colorTxt='var(--blue)';     textoFecha='En ' + r.diasHasta + ' días'; }
+
+        return '<div style="display:flex;align-items:center;gap:8px;padding:8px 10px;' +
+          'background:' + colorBg + ';border:1px solid ' + colorTxt + '33;border-radius:var(--r);' +
+          'margin-bottom:6px;cursor:pointer;" data-rev-id="' + l.id + '">' +
+          '<div style="flex:1;min-width:0;">' +
+            '<div style="font-size:13px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' +
+              esc(l.nombre) +
+            '</div>' +
+            '<div style="font-size:10px;color:var(--text-dim);">' + esc(r.motivo) + '</div>' +
+          '</div>' +
+          '<div style="text-align:right;flex-shrink:0;">' +
+            '<div style="font-size:11px;font-weight:800;font-family:var(--mono);color:' + colorTxt + ';">' +
+              textoFecha +
+            '</div>' +
+            (l.telefono ? '<div style="font-size:9px;color:var(--text-dim);">📞</div>' : '') +
+          '</div>' +
+        '</div>';
+      }).join('');
+
+      /* Click en revisita → abrir ficha */
+      contRevis.querySelectorAll('[data-rev-id]').forEach(el => {
+        el.addEventListener('click', () => {
+          expandPanel();
+          abrirModalLead(el.dataset.revId);
+        });
+      });
+    }
+  }
 
   const backups = await DB.loadBackups(5);
   $('#lista-backups').innerHTML = backups.length
@@ -3181,30 +4256,10 @@ async function renderStats() {
   });
 }
 
+/* Botones simples — el avanzado está en btn-exportar-avanzado */
 $('#btn-exportar').addEventListener('click', exportarJSON);
-$('#btn-importar').addEventListener('click', () => $('#file-import').click());
-$('#file-import').addEventListener('change', e => {
-  const f = e.target.files[0]; if (!f) return;
-  const r = new FileReader();
-  r.onload = async ev => {
-    try {
-      const data = JSON.parse(ev.target.result);
-      if (!data.leads) throw new Error('Archivo inválido');
-      if (!confirm(`Importar ${data.leads.length} leads?`)) return;
-      await DB.clearLeads();
-      await DB.saveLeads(data.leads);
-      state.leads = data.leads;
-      state.leads.forEach(l => delete l._iut);
-      if (data.mensajes) state.mensajes = data.mensajes;
-      if (data.ruta)     state.ruta     = data.ruta;
-      _leadMarkersMap.forEach(m => map.removeLayer(m));
-      _leadMarkersMap.clear();
-      renderLeads(); renderMapLeads();
-      toast('Importado ✓');
-    } catch(err) { alert('Error: '+err.message); }
-  };
-  r.readAsText(f); e.target.value='';
-});
+$('#btn-importar').addEventListener('click', abrirExportadorAvanzado);
+/* file-import legacy — ya no se usa, reemplazado por exp-file-input dentro del modal */
 
 $('#btn-borrar-todo').addEventListener('click', async () => {
   if (!confirm('⚠️ ¿Borrar TODOS los datos?')) return;
@@ -3481,6 +4536,7 @@ async function init() {
     if (pendHoy > 0) setTimeout(() => toast(`⏰ ${pendHoy} seguimiento(s) hoy`), 1000);
 
     /* 9. UI inicial */
+    initMultiRubro();
     setTab('terreno');
     collapsePanel();
 
