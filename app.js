@@ -1870,39 +1870,45 @@ async function buscarGoogle(ciudad, rubro) {
     }, 30000);
 
     function procesarPagina(results, status, pagination) {
+      const diag = $('#buscar-info');
+
       if (status === google.maps.places.PlacesServiceStatus.OK ||
           status === google.maps.places.PlacesServiceStatus.ZERO_RESULTS) {
         acumulados = acumulados.concat(results || []);
       }
 
+      /* DIAGNÓSTICO VISIBLE — aparece en pantalla debajo del buscador */
+      const diagInfo = [
+        `Pág ${pagina}: ${(results||[]).length} resultados (total: ${acumulados.length})`,
+        `status: ${status}`,
+        `hasNextPage: ${pagination?.hasNextPage ?? 'N/A'}`,
+        `pagination existe: ${!!pagination}`,
+        `nextPage es función: ${typeof pagination?.nextPage === 'function'}`
+      ].join(' | ');
+      if (diag) diag.innerHTML = `<span style="font-size:10px;font-family:var(--mono);color:var(--accent);">${diagInfo}</span>`;
+      console.log('[Pag]', diagInfo);
+
       const hayMas = pagination?.hasNextPage && pagina < MAX_PAG;
 
       if (!hayMas) {
-        /* Terminamos — todas las páginas o sin más resultados */
         clearTimeout(timeoutGral);
         resolve(acumulados);
         return;
       }
 
-      /* Hay más páginas — esperar y pedir la siguiente */
       pagina++;
       setTimeout(() => {
         try {
-          /*
-           * nextPage() llama a procesarPagina de nuevo.
-           * El callback sigue vivo porque vive en el closure,
-           * no dentro de una Promise que ya resolvió.
-           */
           pagination.nextPage(procesarPagina);
         } catch(e) {
-          console.warn('[Pag] nextPage() falló:', e.message);
+          if (diag) diag.textContent = 'nextPage() error: ' + e.message;
           clearTimeout(timeoutGral);
           resolve(acumulados);
         }
       }, DELAY_PAG_MS);
     }
 
-    /* Lanzar página 1 — el mismo callback maneja todas las páginas */
+    /* Lanzar página 1 */
     service.textSearch(
       { query: `${rubro} ${ciudad}`, location, radius: 15000 },
       procesarPagina
