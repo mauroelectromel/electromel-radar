@@ -464,7 +464,10 @@
         </select>
       </div>
 
-      <button class="btn btn-g btn-block" id="btn-buscar">BUSCAR OBJETIVOS</button>
+      <div style="display:grid;grid-template-columns:1fr auto;gap:6px;">
+        <button class="btn btn-g" id="btn-buscar">BUSCAR OBJETIVOS</button>
+        <button class="btn btn-r" id="btn-frenar" style="display:none;min-width:52px;padding:0;" title="Frenar búsqueda">⏹</button>
+      </div>
       <div id="buscar-info"
            class="muted"
            style="margin-top:8px;text-align:center;font-family:var(--mono);font-size:11px;"></div>
