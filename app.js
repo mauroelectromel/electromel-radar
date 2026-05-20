@@ -1984,8 +1984,12 @@ async function buscarGoogle(ciudad, rubro) {
     }
 
     /* Página 1 */
+    /* IMPORTANTE: NO pasar location+radius en textSearch cuando se usa paginación.
+     * Google calcula el área internamente por ciudad en el query.
+     * Pasar location+radius hace que la página 2 quede fuera del área
+     * y devuelva vacío silenciosamente. */
     service.textSearch(
-      { query: rubro + ' ' + ciudad, location: location, radius: 15000 },
+      { query: rubro + ' ' + ciudad + ' Argentina' },
       procesarPagina
     );
   });
