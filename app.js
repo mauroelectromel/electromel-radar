@@ -713,14 +713,29 @@ $('#panel-handle').addEventListener('click', () => {
   else collapsePanel();
 });
 
-let _touchStartY = 0;
-$('#bottom-panel').addEventListener('touchstart', e => {
-  _touchStartY = e.touches[0].clientY;
+/*
+ * Swipe del panel: SOLO reacciona si el gesto empezó en #panel-handle.
+ * Si el toque empieza en #panel-content (la lista scrolleable), lo ignora.
+ * Así el usuario puede scrollear las listas sin colapsar el panel.
+ */
+let _touchStartY   = 0;
+let _swipeEnHandle = false;
+
+$('#panel-handle').addEventListener('touchstart', e => {
+  _touchStartY   = e.touches[0].clientY;
+  _swipeEnHandle = true;
 }, { passive: true });
+
+$('#panel-content').addEventListener('touchstart', () => {
+  _swipeEnHandle = false; /* toque dentro del contenido — no es swipe de panel */
+}, { passive: true });
+
 $('#bottom-panel').addEventListener('touchend', e => {
+  if (!_swipeEnHandle) return; /* ignorar — el toque empezó en el contenido */
   const dy = e.changedTouches[0].clientY - _touchStartY;
-  if      (dy >  80) { if (state.panelState==='expanded') halfPanel(); else collapsePanel(); }
-  else if (dy < -80) { if (state.panelState==='collapsed') halfPanel(); else if (state.panelState==='half') expandPanel(); }
+  if      (dy >  60) { if (state.panelState==='expanded') halfPanel(); else collapsePanel(); }
+  else if (dy < -60) { if (state.panelState==='collapsed') halfPanel(); else if (state.panelState==='half') expandPanel(); }
+  _swipeEnHandle = false;
 }, { passive: true });
 
 /* ======================================================================
@@ -1790,16 +1805,123 @@ async function buscarGoogle(ciudad, rubro) {
   const service  = getPlacesService();
   const location = geoResult.geometry.location;
 
-  /* textSearch — devuelve lista base SIN teléfonos */
-  const places = await new Promise((resolve, reject) => {
-    service.textSearch(
-      { query: `${rubro} ${ciudad}`, location, radius: 15000 },
-      (results, status) => {
-        const S = google.maps.places.PlacesServiceStatus;
-        if (status === S.OK || status === S.ZERO_RESULTS) resolve(results || []);
-        else reject(new Error(`Google Places: ${status}`));
+  /*
+   * textSearch paginado — hasta 3 páginas × 20 resultados = 60 máximo.
+   *
+   * Reglas de la API de Google:
+   * - Cada página devuelve hasta 20 resultados.
+   * - next_page_token tarda ~2 segundos en activarse después de la
+   *   respuesta anterior — si lo usás antes, devuelve INVALID_REQUEST.
+   * - Máximo 3 páginas por búsqueda (límite de Google, no nuestro).
+   */
+  const MAX_PAGINAS = 3;
+  const DELAY_PAGINACION = 2100; /* ms mínimos entre páginas — Google exige ~2s */
+
+  async function textSearchPaginado(request) {
+    const S      = google.maps.places.PlacesServiceStatus;
+    let todos    = [];
+    let pagina   = 0;
+    let token    = null;
+
+    while (pagina < MAX_PAGINAS) {
+      const req = token ? { ...request, pageToken: token } : request;
+
+      const { results, nextToken, status } = await new Promise((resolve, reject) => {
+        const cb = (results, status, pagination) => {
+          if (status === S.OK || status === S.ZERO_RESULTS) {
+            resolve({
+              results:   results || [],
+              nextToken: pagination?.hasNextPage ? pagination : null,
+              status
+            });
+          } else {
+            reject(new Error('Google Places: ' + status));
+          }
+        };
+
+        if (token) {
+          /* Página 2 y 3 — pasamos el objeto pagination directamente */
+          token.nextPage();
+          /* El callback ya fue registrado en la iteración anterior */
+          resolve({ results: [], nextToken: null, status: S.OK });
+        } else {
+          service.textSearch(req, cb);
+        }
+      });
+
+      todos = todos.concat(results);
+      pagina++;
+
+      if (!nextToken || results.length < 20) break;
+      token = nextToken;
+
+      /* Esperar que el token se active antes de pedir la siguiente página */
+      if (pagina < MAX_PAGINAS) {
+        await new Promise(res => setTimeout(res, DELAY_PAGINACION));
       }
-    );
+    }
+
+    return todos;
+  }
+
+  /*
+   * La API de paginación de PlacesService usa un objeto `pagination`
+   * con método `nextPage()` que reutiliza el mismo callback.
+   * Implementación limpia con promesa única por página:
+   */
+  async function textSearchTodas(request) {
+    const S    = google.maps.places.PlacesServiceStatus;
+    let todos  = [];
+    let pagina = 0;
+
+    const pedirPagina = (req) => new Promise((resolve, reject) => {
+      service.textSearch(req, (results, status, pagination) => {
+        if (status === S.OK || status === S.ZERO_RESULTS) {
+          resolve({ results: results || [], pagination });
+        } else {
+          reject(new Error('Google Places p' + (pagina+1) + ': ' + status));
+        }
+      });
+    });
+
+    /* Página 1 */
+    let { results, pagination } = await pedirPagina(request);
+    todos = todos.concat(results);
+    pagina++;
+
+    /* Páginas 2 y 3 — solo si hay más y no superamos el límite */
+    while (
+      pagina < MAX_PAGINAS &&
+      pagination?.hasNextPage &&
+      results.length === 20
+    ) {
+      /* Esperar que el token esté listo (Google exige ~2 segundos) */
+      await new Promise(res => setTimeout(res, DELAY_PAGINACION));
+
+      const siguiente = await new Promise((resolve, reject) => {
+        pagination.nextPage((res2, st2, pag2) => {
+          if (st2 === S.OK || st2 === S.ZERO_RESULTS) {
+            resolve({ results: res2 || [], pagination: pag2 });
+          } else {
+            /* Página extra falló — no es crítico, devolver lo que tenemos */
+            resolve({ results: [], pagination: null });
+          }
+        });
+      });
+
+      todos     = todos.concat(siguiente.results);
+      pagination = siguiente.pagination;
+      results    = siguiente.results;
+      pagina++;
+    }
+
+    return todos;
+  }
+
+  const places = await textSearchTodas({
+    query:    `${rubro} ${ciudad}`,
+    location,
+    radius:   15000
   });
 
   /* Mapear resultados base — telefono vacío por ahora */
