@@ -1908,39 +1908,97 @@ async function buscarGoogle(ciudad, rubro) {
  * Node — no con Promise directa.
  */
 async function cargarPaginasExtra(resultadosBase) {
-  const pag = buscarGoogle._pagination;
-  if (!pag?.hasNextPage) return;
+  /*
+   * PAGINACIÓN REAL de Google Places JS API.
+   *
+   * La documentación oficial dice que nextPage() reutiliza el
+   * callback original. Pero en la práctica ese callback ya resolvió
+   * una Promise — invocar nextPage() con un callback propio es ignorado.
+   *
+   * La única forma confiable: guardar el pageToken de la respuesta
+   * anterior y hacer una nueva llamada a textSearch() con ese token.
+   * El objeto PlacesSearchPagination expone el token en
+   * pagination.za o pagination.Qa según la versión del SDK (ofuscado).
+   *
+   * Para no depender de propiedades ofuscadas que cambian con cada
+   * release de Google, usamos una Promise que se resuelve desde
+   * dentro del callback original registrado en textSearch().
+   *
+   * PATRÓN CORRECTO:
+   *   1. textSearch(req, cb) donde cb recibe (results, status, pagination)
+   *   2. Guardar resolve/reject en closures externos al cb
+   *   3. Llamar pagination.nextPage() SIN argumentos
+   *   4. El SDK llama al mismo cb con los nuevos resultados
+   *   5. El cb resuelve la promise nueva desde el closure
+   */
+  const service = getPlacesService();
+  const S       = google.maps.places.PlacesServiceStatus;
+  const info    = $('#buscar-info');
+  const rubro   = buscarGoogle._rubro;
+  const ciudad  = buscarGoogle._ciudad;
 
-  const S         = google.maps.places.PlacesServiceStatus;
-  const info      = $('#buscar-info');
-  let paginaActual = pag;
-  let pagNum       = 2;
-  const MAX_PAG    = 3;
+  /* La pagination de la página 1 fue guardada en buscarGoogle._pagination */
+  let paginaActual = buscarGoogle._pagination;
+  if (!paginaActual?.hasNextPage) return;
+
+  let pagNum  = 2;
+  const MAX_PAG = 3;
 
   while (paginaActual?.hasNextPage && pagNum <= MAX_PAG) {
-    /* Google exige ~2s entre páginas */
+
+    /* Google exige mínimo 2s entre páginas */
     await new Promise(res => setTimeout(res, 2200));
 
-    const nuevos = await new Promise(resolve => {
-      try {
-        paginaActual.nextPage((results, status, nextPag) => {
+    /* Promise controlada desde FUERA del callback */
+    let _resolve, _reject;
+    const promesa = new Promise((res, rej) => { _resolve = res; _reject = rej; });
+
+    /* Timeout de seguridad por si el callback nunca llega */
+    const tid = setTimeout(() => _resolve([]), 15000);
+
+    /* Reemplazar el service por uno nuevo con callback fresco */
+    const tempDiv   = document.createElement('div');
+    const svcFresco = new google.maps.places.PlacesService(tempDiv);
+
+    /* nextPage internamente hace una nueva textSearch con el token */
+    /* Para capturarlo necesitamos un service con callback nuevo    */
+    /* Alternativa: llamar textSearch directamente con el token     */
+
+    /*
+     * Extraer el pageToken del objeto pagination.
+     * Google ofusca las propiedades pero el token siempre es un string
+     * de ~200 chars. Lo buscamos dinámicamente en las propiedades del objeto.
+     */
+    const token = Object.values(paginaActual).find(
+      v => typeof v === 'string' && v.length > 100
+    ) || null;
+
+    if (token) {
+      /* Llamada directa con pageToken — confiable y sin depender de nextPage() */
+      svcFresco.textSearch(
+        { query: `${rubro} ${ciudad}`, pageToken: token },
+        (results, status, nextPag) => {
+          clearTimeout(tid);
           if (status === S.OK || status === S.ZERO_RESULTS) {
-            paginaActual = nextPag || null;
-            resolve(results || []);
+            paginaActual = (nextPag?.hasNextPage) ? nextPag : null;
+            _resolve(results || []);
           } else {
             paginaActual = null;
-            resolve([]);
+            _resolve([]);
           }
-        });
-      } catch(e) {
-        paginaActual = null;
-        resolve([]);
-      }
-    });
+        }
+      );
+    } else {
+      /* No se pudo extraer el token — detener paginación */
+      clearTimeout(tid);
+      paginaActual = null;
+      _resolve([]);
+    }
 
+    const nuevos = await promesa;
     if (!nuevos.length) break;
 
-    /* Mapear y deduplicar contra los ya existentes */
+    /* Deduplicar */
     const idsExistentes = new Set(resultadosBase.map(r => r.googleId).filter(Boolean));
     const mapeados = nuevos
       .filter(r => r.place_id && !idsExistentes.has(r.place_id))
@@ -1961,7 +2019,7 @@ async function cargarPaginasExtra(resultadosBase) {
 
     if (!mapeados.length) break;
 
-    /* Aplicar cache de teléfonos a los nuevos */
+    /* Cache de teléfonos existentes */
     mapeados.forEach(r => {
       if (r.googleId && _detailsCache.has(r.googleId)) {
         const c = _detailsCache.get(r.googleId);
@@ -1970,26 +2028,28 @@ async function cargarPaginasExtra(resultadosBase) {
       }
     });
 
-    /* Agregar a resultados globales */
+    /* Agregar a state */
     state.resultados = state.resultados.concat(mapeados);
     mapeados.forEach(r => resultadosBase.push(r));
 
-    /* Agregar cards nuevas al DOM sin re-render completo */
+    /* Renderizar cards nuevas */
     const cont = $('#resultados-buscar');
-    const frag = document.createElement('div');
-    frag.innerHTML = mapeados.map((n, i) => {
+    mapeados.forEach((n, i) => {
       const tel    = !!(n.telefono && limpiarTel(n.telefono).length >= 6);
       const yaLead = !!encontrarLeadExistente(n);
       const iut    = calcularIUT({ ...n, equipos: [], tags: [] });
       n.iut = iut;
-      const gid    = n.googleId ? `data-google-id="${esc(n.googleId)}"` : '';
-      let telHtml  = n.googleId
-        ? `<div class="rc-meta rc-tel-slot muted"><span class="spinner" style="width:10px;height:10px;border-width:1px;vertical-align:middle;margin-right:4px;"></span>Cargando...</div>`
-        : `<div class="rc-meta rc-tel-slot muted">Sin teléfono</div>`;
-      if (tel) telHtml = `<div class="rc-meta rc-tel-slot">📞 <strong>${esc(n.telefono)}</strong></div>`;
-      const idx = state.resultados.length - mapeados.length + i;
-      return `
-      <div class="result-card src-g" ${gid}>
+
+      const div = document.createElement('div');
+      div.className = 'result-card src-g';
+      if (n.googleId) div.dataset.googleId = n.googleId;
+
+      const telHtml = tel
+        ? `<div class="rc-meta rc-tel-slot">📞 <strong>${esc(n.telefono)}</strong></div>`
+        : `<div class="rc-meta rc-tel-slot muted"><span class="spinner" style="width:10px;height:10px;border-width:1px;vertical-align:middle;margin-right:4px;"></span>Cargando...</div>`;
+
+      const idx = state.resultados.indexOf(n);
+      div.innerHTML = `
         <div class="rc-header">
           <div class="rc-name">${esc(n.nombre)} <span class="iut-badge ${iutClase(iut)}" style="font-size:9px;">${iutLabel(iut)}${iut}</span></div>
           ${n.rating ? `<div style="color:var(--yellow);font-size:11px;">★ ${n.rating}</div>` : ''}
@@ -1997,52 +2057,44 @@ async function cargarPaginasExtra(resultadosBase) {
         ${n.direccion ? `<div class="rc-meta">📍 ${esc(n.direccion)}</div>` : ''}
         ${telHtml}
         <div class="rc-actions">
-          <button class="btn btn-sm" data-rc-maps="${idx}">MAPS</button>
-          ${tel ? `<button class="btn btn-sm btn-b rc-wa-btn" data-rc-wa="${idx}">WA</button>` : ''}
-          <button class="btn btn-sm ${yaLead?'':'btn-em'}" data-rc-add="${idx}" ${yaLead?'disabled style="opacity:0.5;"':''}>
+          <button class="btn btn-sm btn-maps">MAPS</button>
+          ${tel ? `<button class="btn btn-sm btn-b rc-wa-btn btn-wa">WA</button>` : ''}
+          <button class="btn btn-sm ${yaLead?'':'btn-em'} btn-add" ${yaLead?'disabled style="opacity:0.5;"':''}>
             ${yaLead ? '✓ GUARDADO' : '+ GUARDAR'}
           </button>
-        </div>
-      </div>`;
-    }).join('');
+        </div>`;
 
-    /* Bindear listeners en las cards nuevas */
-    frag.querySelectorAll('[data-rc-maps]').forEach(b =>
-      b.addEventListener('click', () => abrirMaps(state.resultados[+b.dataset.rcMaps])));
-    frag.querySelectorAll('[data-rc-add]').forEach(b => {
-      b.addEventListener('click', async () => {
-        const n = state.resultados[+b.dataset.rcAdd];
-        if (!n || encontrarLeadExistente(n)) return;
+      div.querySelector('.btn-maps').addEventListener('click', () => abrirMaps(n));
+      div.querySelector('.btn-add').addEventListener('click', async (ev) => {
+        if (encontrarLeadExistente(n)) return;
         const lead = crearLeadDesdeResultado(n);
         await dbSaveLead(lead);
         if (lead.lat && lead.lon && state.mapLeadsVisible) {
-          const m = L.marker([lead.lat, lead.lon], { icon: createLeadIcon(lead) })
-            .addTo(map).on('click', () => { expandPanel(); setTab('leads'); setTimeout(() => abrirModalLead(lead.id), 200); });
+          const m = L.marker([lead.lat,lead.lon],{icon:createLeadIcon(lead)})
+            .addTo(map).on('click',()=>{expandPanel();setTab('leads');setTimeout(()=>abrirModalLead(lead.id),200);});
           _leadMarkersMap.set(lead.id, m);
         }
-        b.textContent = '✓ GUARDADO'; b.disabled = true; b.classList.remove('btn-em');
+        ev.target.textContent='✓ GUARDADO';
+        ev.target.disabled=true;
+        ev.target.classList.remove('btn-em');
         toast('✓ Lead guardado');
       });
-    });
-    frag.querySelectorAll('[data-rc-wa]').forEach(b => {
-      b.addEventListener('click', async () => {
-        const n = state.resultados[+b.dataset.rcWa];
+      div.querySelector('.btn-wa')?.addEventListener('click', async () => {
         let lead = encontrarLeadExistente(n);
         if (!lead) { lead = crearLeadDesdeResultado(n); await dbSaveLead(lead); }
         abrirWhatsApp(lead, 'primero');
       });
+
+      cont.appendChild(div);
     });
 
-    /* Mover children del fragment al contenedor real */
-    while (frag.firstChild) cont.appendChild(frag.firstChild);
-
-    /* Agregar markers al mapa */
+    /* Markers */
     renderMapResults(state.resultados);
 
-    /* Actualizar contador */
+    /* Contador */
     if (info) info.textContent = `${state.resultados.length} objetivo(s) encontrado(s)`;
 
-    /* Enriquecer teléfonos de los nuevos en background */
+    /* Teléfonos en background */
     lanzarEnriquecimiento(mapeados);
 
     pagNum++;
@@ -2050,7 +2102,6 @@ async function cargarPaginasExtra(resultadosBase) {
 
   buscarGoogle._pagination = null;
 }
-
 async function lanzarEnriquecimiento(resultados) {
   const conGoogleId = resultados.filter(r => r.fuente === 'google' && r.googleId);
   if (!conGoogleId.length) return;
