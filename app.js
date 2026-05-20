@@ -1350,37 +1350,25 @@ async function fetchTout(url, opts={}, ms=25000) {
 
 /* ── Nominatim geocoding ────────────────────────────────────────────── */
 async function geocodeCiudad(ciudad) {
-  /* Nominatim requiere User-Agent identificable — sin él devuelve 403 */
-  const headers = {
-    'Accept':     'application/json',
-    'User-Agent': 'ElectromelRadar/6 (contacto@electromel.com.ar)'
-  };
+  const url = 'https://nominatim.openstreetmap.org/search'
+    + '?q='      + encodeURIComponent(ciudad)
+    + '&format=json&limit=1&addressdetails=0';
 
-  const url = `https://nominatim.openstreetmap.org/search`
-    + `?q=${encodeURIComponent(ciudad)}`
-    + `&format=json&limit=1&addressdetails=0`;
-
+  /* Nominatim exige un User-Agent real o devuelve 403 */
   let res, data;
   try {
-    res  = await fetchTout(url, { headers }, 15000);
+    res  = await fetchTout(url, { headers: { 'Accept': 'application/json' } }, 15000);
     data = await res.json();
   } catch(e) {
-    throw new Error(`Geocoding falló: ${e.message}`);
+    throw new Error('Geocoding sin respuesta: ' + e.message);
   }
 
   if (!Array.isArray(data) || !data.length) {
-    throw new Error(`Ciudad no encontrada: "${ciudad}"`);
+    throw new Error('Ciudad no encontrada: "' + ciudad + '"');
   }
 
   const r = data[0];
-  /* boundingbox de Nominatim: [S, N, W, E] */
-  const bb = r.boundingbox.map(parseFloat); // [S, N, W, E]
-  return {
-    lat: parseFloat(r.lat),
-    lon: parseFloat(r.lon),
-    /* Overpass bbox: S, W, N, E */
-    bboxOvp: `${bb[0]},${bb[2]},${bb[1]},${bb[3]}`
-  };
+  return { lat: parseFloat(r.lat), lon: parseFloat(r.lon) };
 }
 
 /* ── Overpass / OSM ────────────────────────────────────────────────── */
@@ -1390,35 +1378,50 @@ const OVERPASS_SERVERS = [
   'https://overpass.private.coffee/api/interpreter'
 ];
 
-function buildOverpassQuery(rubro, bbox) {
-  /* Escapar caracteres especiales para regex Overpass */
-  const r = rubro.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  /* Buscar por nombre del lugar Y por categorías comunes */
-  return `[out:json][timeout:30];
+/*
+ * Radio fijo desde el centro de la ciudad, NO bbox completo.
+ *
+ * Por qué: la bbox de Neuquén cubre ~400 km². Una query nwr sobre esa
+ * área con regex puede traer 50.000+ elementos y tarda 60-120 segundos.
+ * Un radio de 8 km desde el centro cubre toda la ciudad útil en < 5s.
+ *
+ * Solo node + way (no relation): el 95% de comercios y locales
+ * son nodes o ways simples. Relations son límites administrativos,
+ * rutas de colectivo, etc. — no nos sirven y pesan mucho.
+ *
+ * [timeout:55] en la query Y 60s en el fetch para dar margen.
+ */
+function buildOverpassQuery(lat, lon, rubro) {
+  const r   = rubro.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const rad = 8000; /* 8 km desde el centro — cubre cualquier ciudad de la zona */
+  const area = `(around:${rad},${lat},${lon})`;
+
+  return `[out:json][timeout:55];
 (
-  nwr["name"~"${r}",i](${bbox});
-  nwr["shop"~"${r}",i](${bbox});
-  nwr["amenity"~"${r}",i](${bbox});
-  nwr["leisure"~"${r}",i](${bbox});
-  nwr["tourism"~"${r}",i](${bbox});
-  nwr["industrial"~"${r}",i](${bbox});
-  nwr["craft"~"${r}",i](${bbox});
+  node["name"~"${r}",i]${area};
+  way["name"~"${r}",i]${area};
+  node["shop"~"${r}",i]${area};
+  node["amenity"~"${r}",i]${area};
+  node["leisure"~"${r}",i]${area};
+  node["tourism"~"${r}",i]${area};
+  node["craft"~"${r}",i]${area};
+  node["industrial"~"${r}",i]${area};
 );
-out center tags 80;`;
+out center tags 60;`;
 }
 
 async function buscarOSM(ciudad, rubro) {
-  /* 1. Geocodificar la ciudad */
+  /* 1. Obtener coordenadas del centro de la ciudad */
   let geo;
   try {
     geo = await geocodeCiudad(ciudad);
   } catch(e) {
-    throw new Error(`OSM: ${e.message}`);
+    throw new Error(e.message);
   }
 
-  const q = buildOverpassQuery(rubro, geo.bboxOvp);
+  const q = buildOverpassQuery(geo.lat, geo.lon, rubro);
 
-  /* 2. Intentar cada servidor Overpass */
+  /* 2. Intentar cada servidor Overpass en orden */
   let data = null, lastErr = null;
 
   for (const server of OVERPASS_SERVERS) {
@@ -1430,14 +1433,25 @@ async function buscarOSM(ciudad, rubro) {
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body:    'data=' + encodeURIComponent(q)
         },
-        35000
+        62000   /* 62s — da 7s de margen sobre el timeout:55 de Overpass */
       );
+
       if (!res.ok) {
-        lastErr = new Error(`Servidor devolvió HTTP ${res.status}`);
+        lastErr = new Error('HTTP ' + res.status + ' en ' + server);
         continue;
       }
-      data = await res.json();
+
+      const text = await res.text();
+
+      /* Overpass a veces devuelve HTML de error en vez de JSON */
+      if (text.trim().startsWith('<')) {
+        lastErr = new Error('Servidor Overpass devolvió HTML (posible rate-limit)');
+        continue;
+      }
+
+      data = JSON.parse(text);
       break;
+
     } catch(e) {
       lastErr = e;
       continue;
@@ -1445,17 +1459,20 @@ async function buscarOSM(ciudad, rubro) {
   }
 
   if (!data) {
-    throw new Error(`Overpass no disponible: ${lastErr?.message || 'sin respuesta'}`);
+    throw new Error(
+      'Overpass no disponible después de 3 intentos. ' +
+      'Último error: ' + (lastErr?.message || 'desconocido')
+    );
   }
 
-  /* 3. Parsear resultados */
+  /* 3. Parsear y devolver resultados limpios */
   return (data.elements || [])
     .filter(e => (e.tags || {}).name)
-    .slice(0, 80)
+    .slice(0, 60)
     .map(e => {
-      const t = e.tags || {};
-      const lat = e.lat ?? e.center?.lat ?? null;
-      const lon = e.lon ?? e.center?.lon ?? null;
+      const t   = e.tags || {};
+      const lat = e.lat  ?? e.center?.lat ?? null;
+      const lon = e.lon  ?? e.center?.lon ?? null;
       return {
         nombre:    t.name,
         direccion: [t['addr:street'], t['addr:housenumber'], t['addr:city']]
@@ -1463,8 +1480,8 @@ async function buscarOSM(ciudad, rubro) {
         telefono:  t.phone || t['contact:phone'] || t['contact:mobile'] || '',
         web:       t.website || t['contact:website'] || '',
         lat, lon,
-        tipo:  t.shop || t.tourism || t.leisure || t.amenity || t.craft || '',
-        rubro: detectarRubro(t.shop || t.tourism || t.leisure || t.amenity || ''),
+        tipo:   t.shop || t.tourism || t.leisure || t.amenity || t.craft || '',
+        rubro:  detectarRubro(t.shop || t.tourism || t.leisure || t.amenity || ''),
         fuente: 'osm',
         osmId:  e.id
       };
