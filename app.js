@@ -1445,112 +1445,73 @@ async function geocodeCiudad(ciudad) {
   return { lat: parseFloat(r.lat), lon: parseFloat(r.lon) };
 }
 
-/* ── Overpass / OSM ────────────────────────────────────────────────── */
+/* ── Overpass / OSM — GRID SEARCH ──────────────────────────────────── */
+/*
+ * GRID SEARCH: divide la ciudad en una grilla de celdas pequeñas
+ * y hace una query Overpass por celda en paralelo.
+ *
+ * Por qué supera al radio único:
+ *   - Radio 8km único → Overpass devuelve ~60 elementos (límite interno)
+ *   - Grid 5×5 = 25 celdas de 2.5km → hasta 750 elementos únicos
+ *
+ * Celdas de 2.5km × 2.5km con 20% de solapamiento para no perder
+ * negocios en los bordes. Duplicados eliminados por osmId.
+ * Queries de a 3 simultáneas para no saturar Overpass.
+ */
+
 const OVERPASS_SERVERS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
   'https://overpass.private.coffee/api/interpreter'
 ];
 
-/*
- * Radio fijo desde el centro de la ciudad, NO bbox completo.
- *
- * Por qué: la bbox de Neuquén cubre ~400 km². Una query nwr sobre esa
- * área con regex puede traer 50.000+ elementos y tarda 60-120 segundos.
- * Un radio de 8 km desde el centro cubre toda la ciudad útil en < 5s.
- *
- * Solo node + way (no relation): el 95% de comercios y locales
- * son nodes o ways simples. Relations son límites administrativos,
- * rutas de colectivo, etc. — no nos sirven y pesan mucho.
- *
- * [timeout:55] en la query Y 60s en el fetch para dar margen.
- */
-function buildOverpassQuery(lat, lon, rubro) {
-  const r   = rubro.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const rad = 8000; /* 8 km desde el centro — cubre cualquier ciudad de la zona */
-  const area = `(around:${rad},${lat},${lon})`;
+let _overpassServerIdx = 0;
 
-  return `[out:json][timeout:55];
-(
-  node["name"~"${r}",i]${area};
-  way["name"~"${r}",i]${area};
-  node["shop"~"${r}",i]${area};
-  node["amenity"~"${r}",i]${area};
-  node["leisure"~"${r}",i]${area};
-  node["tourism"~"${r}",i]${area};
-  node["craft"~"${r}",i]${area};
-  node["industrial"~"${r}",i]${area};
-);
-out center tags 60;`;
-}
-
-async function buscarOSM(ciudad, rubro) {
-  /* 1. Obtener coordenadas del centro de la ciudad */
-  let geo;
-  try {
-    geo = await geocodeCiudad(ciudad);
-  } catch(e) {
-    throw new Error(e.message);
-  }
-
-  const q = buildOverpassQuery(geo.lat, geo.lon, rubro);
-
-  /* 2. Intentar cada servidor Overpass en orden */
-  let data = null, lastErr = null;
-
-  for (const server of OVERPASS_SERVERS) {
+async function queryOverpass(q) {
+  const n = OVERPASS_SERVERS.length;
+  for (let i = 0; i < n; i++) {
+    const server = OVERPASS_SERVERS[(_overpassServerIdx + i) % n];
     try {
       const res = await fetchTout(
         server,
-        {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body:    'data=' + encodeURIComponent(q)
-        },
-        62000   /* 62s — da 7s de margen sobre el timeout:55 de Overpass */
+        { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'data='+encodeURIComponent(q) },
+        30000
       );
-
-      if (!res.ok) {
-        lastErr = new Error('HTTP ' + res.status + ' en ' + server);
-        continue;
-      }
-
+      if (!res.ok) continue;
       const text = await res.text();
-
-      /* Overpass a veces devuelve HTML de error en vez de JSON */
-      if (text.trim().startsWith('<')) {
-        lastErr = new Error('Servidor Overpass devolvió HTML (posible rate-limit)');
-        continue;
-      }
-
-      data = JSON.parse(text);
-      break;
-
-    } catch(e) {
-      lastErr = e;
-      continue;
-    }
+      if (text.trim().startsWith('<')) continue;
+      _overpassServerIdx = (_overpassServerIdx + i) % n;
+      return JSON.parse(text);
+    } catch(e) { continue; }
   }
+  return null;
+}
 
-  if (!data) {
-    throw new Error(
-      'Overpass no disponible después de 3 intentos. ' +
-      'Último error: ' + (lastErr?.message || 'desconocido')
-    );
-  }
+function buildCeldaQuery(latMin, lonMin, latMax, lonMax, rubro) {
+  const r    = rubro.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const bbox = latMin+','+lonMin+','+latMax+','+lonMax;
+  return '[out:json][timeout:25];\n(\n' +
+    '  node["name"~"'+r+'",i]('+bbox+');\n' +
+    '  way["name"~"'+r+'",i]('+bbox+');\n' +
+    '  node["shop"~"'+r+'",i]('+bbox+');\n' +
+    '  node["amenity"~"'+r+'",i]('+bbox+');\n' +
+    '  node["leisure"~"'+r+'",i]('+bbox+');\n' +
+    '  node["tourism"~"'+r+'",i]('+bbox+');\n' +
+    '  node["craft"~"'+r+'",i]('+bbox+');\n' +
+    '  node["industrial"~"'+r+'",i]('+bbox+');\n' +
+    ');\nout center tags 30;';
+}
 
-  /* 3. Parsear y devolver resultados limpios */
-  return (data.elements || [])
+function parsearElementos(elements) {
+  return (elements || [])
     .filter(e => (e.tags || {}).name)
-    .slice(0, 60)
     .map(e => {
       const t   = e.tags || {};
-      const lat = e.lat  ?? e.center?.lat ?? null;
-      const lon = e.lon  ?? e.center?.lon ?? null;
+      const lat = e.lat != null ? e.lat : (e.center ? e.center.lat : null);
+      const lon = e.lon != null ? e.lon : (e.center ? e.center.lon : null);
       return {
         nombre:    t.name,
-        direccion: [t['addr:street'], t['addr:housenumber'], t['addr:city']]
-                    .filter(Boolean).join(' '),
+        direccion: [t['addr:street'], t['addr:housenumber'], t['addr:city']].filter(Boolean).join(' '),
         telefono:  t.phone || t['contact:phone'] || t['contact:mobile'] || '',
         web:       t.website || t['contact:website'] || '',
         lat, lon,
@@ -1562,6 +1523,76 @@ async function buscarOSM(ciudad, rubro) {
     });
 }
 
+function generarCeldas(lat, lon, radioKm, celdaKm, solapamiento) {
+  radioKm      = radioKm      || 6;
+  celdaKm      = celdaKm      || 2.5;
+  solapamiento = solapamiento || 0.2;
+  const cosLat = Math.cos(lat * Math.PI / 180);
+  const dLat   = celdaKm / 111;
+  const dLon   = celdaKm / (111 * cosLat);
+  const paso   = celdaKm * (1 - solapamiento);
+  const pLat   = paso / 111;
+  const pLon   = paso / (111 * cosLat);
+  const rLat   = radioKm / 111;
+  const rLon   = radioKm / (111 * cosLat);
+  const celdas = [];
+  for (let dlat = -rLat; dlat < rLat; dlat += pLat) {
+    for (let dlon = -rLon; dlon < rLon; dlon += pLon) {
+      celdas.push({
+        latMin: lat + dlat,
+        lonMin: lon + dlon,
+        latMax: lat + dlat + dLat,
+        lonMax: lon + dlon + dLon
+      });
+    }
+  }
+  return celdas;
+}
+
+async function buscarOSM(ciudad, rubro) {
+  const info = $('#buscar-info');
+
+  let geo;
+  try { geo = await geocodeCiudad(ciudad); }
+  catch(e) { throw new Error(e.message); }
+
+  const celdas    = generarCeldas(geo.lat, geo.lon);
+  const total     = celdas.length;
+  const PARALELAS = 3;
+  const osmIds    = new Set();
+  const todos     = [];
+  let procesadas  = 0;
+
+  const lado = Math.round(Math.sqrt(total));
+  if (info) info.innerHTML =
+    '<span class="spinner" style="width:10px;height:10px;border-width:1px;vertical-align:middle;margin-right:5px;"></span>' +
+    'Grid '+lado+'\u00d7'+lado+' \u00b7 '+total+' celdas \u00b7 0/'+total;
+
+  for (let i = 0; i < celdas.length; i += PARALELAS) {
+    const lote = celdas.slice(i, i + PARALELAS);
+
+    const loteRes = await Promise.all(lote.map(async function(celda) {
+      const q    = buildCeldaQuery(celda.latMin, celda.lonMin, celda.latMax, celda.lonMax, rubro);
+      const data = await queryOverpass(q);
+      return data ? parsearElementos(data.elements || []) : [];
+    }));
+
+    for (const elementos of loteRes) {
+      for (const el of elementos) {
+        if (el.osmId && osmIds.has(el.osmId)) continue;
+        if (el.osmId) osmIds.add(el.osmId);
+        todos.push(el);
+      }
+    }
+
+    procesadas += lote.length;
+    if (info) info.innerHTML =
+      '<span class="spinner" style="width:10px;height:10px;border-width:1px;vertical-align:middle;margin-right:5px;"></span>' +
+      'Escaneando \u00b7 '+procesadas+'/'+total+' celdas \u00b7 <b style="color:var(--accent);">'+todos.length+'</b> objetivos';
+  }
+
+  return todos;
+}
 /* ── Google Places (Maps JavaScript API) ───────────────────────────── */
 /*
    La API REST de Places bloquea CORS desde el browser por diseño de Google.
