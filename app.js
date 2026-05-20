@@ -2195,30 +2195,43 @@ function deduplicarResultados(lista) {
 
 /* ── Motor de búsqueda multi-zona ──────────────────────────────────── */
 async function buscarMultiZona(ciudad, rubro, fuente, onProgreso) {
-  const queries  = generarConsultas(ciudad, rubro);
-  const total    = queries.length;
+  const queries = generarConsultas(ciudad, rubro);
+  const total   = queries.length;
   let acumulados = [];
   let errores    = 0;
+
+  /* Geocodificar la ciudad UNA SOLA VEZ para todas las queries */
+  let geo = null;
+  if (fuente === 'google' && state.gkey) {
+    try {
+      geo = await geocodificarCiudadGoogle(ciudad);
+      if (geo) {
+        console.log('[GEO] Ciudad:', ciudad, '| País:', geo.pais,
+          '| Provincia:', geo.provincia, '| Radio máx:', geo.radioMaxKm.toFixed(1) + 'km');
+      }
+    } catch(e) {
+      console.warn('[GEO] No se pudo geocodificar:', e.message);
+    }
+  }
 
   for (let i = 0; i < queries.length; i++) {
     const q = queries[i];
     onProgreso({
-      fase:      'buscando',
-      consulta:  i + 1,
+      fase:        'buscando',
+      consulta:    i + 1,
       total,
-      query:     q,
+      query:       q,
       encontrados: acumulados.length
     });
 
     try {
       let res;
       if (fuente === 'google') {
-        /* Para multi-zona, buscarGoogleQuery acepta el query completo */
-        res = await buscarGoogleQuery(q);
+        /* Pasar geo para filtrado geográfico en cada query */
+        res = await buscarGoogleQuery(q, geo);
       } else {
-        /* OSM usa grid search — la zona está en el query de Overpass */
+        /* OSM: grid search cubre toda la ciudad, no necesita multi-zona */
         res = await buscarOSM(ciudad, rubro);
-        /* OSM no necesita multi-zona porque el grid cubre toda la ciudad */
         acumulados = acumulados.concat(res);
         break;
       }
@@ -2226,11 +2239,9 @@ async function buscarMultiZona(ciudad, rubro, fuente, onProgreso) {
     } catch(e) {
       errores++;
       console.warn('[MultiZona] Error en query:', q, e.message);
-      /* Si falla más de la mitad, parar para no agotar cuota */
       if (errores > Math.floor(total / 2)) break;
     }
 
-    /* Pausa entre queries para no saturar la API */
     if (i < queries.length - 1) {
       await new Promise(res => setTimeout(res, 800));
     }
@@ -2239,15 +2250,200 @@ async function buscarMultiZona(ciudad, rubro, fuente, onProgreso) {
   return deduplicarResultados(acumulados);
 }
 
+/* ======================================================================
+   VALIDACIÓN GEOGRÁFICA DE RESULTADOS
+   ======================================================================
+
+   PROBLEMA: Google Places devuelve resultados de cualquier parte del mundo
+   cuando el query coincide semánticamente. "hotel San Martín de los Andes"
+   puede devolver hoteles en España o México.
+
+   SOLUCIÓN:
+   1. Geocodificar la ciudad objetivo → obtener lat/lon + bbox + país
+   2. Cada resultado pasa por validarResultadoGeo():
+      - ¿Tiene coordenadas? → calcular distancia al centro
+      - ¿Tiene formatted_address? → verificar que mencione Argentina
+      - ¿Está dentro del radio máximo? → descartar si no
+   3. Score geográfico para ordenar: exactos primero
+   ====================================================================== */
+
+/* Cache de geocodificación para no repetir por ciudad */
+const _geoCache = new Map();
+
+async function geocodificarCiudadGoogle(ciudad) {
+  const key = normalizar(ciudad);
+  if (_geoCache.has(key)) return _geoCache.get(key);
+
+  await cargarGoogleMapsAPI(state.gkey);
+  const geocoder = new google.maps.Geocoder();
+
+  const result = await new Promise((resolve) => {
+    geocoder.geocode(
+      { address: ciudad + ', Argentina' },
+      (results, status) => {
+        if (status === 'OK' && results.length) resolve(results[0]);
+        else resolve(null);
+      }
+    );
+  });
+
+  if (!result) return null;
+
+  const loc      = result.geometry.location;
+  const viewport = result.geometry.viewport;
+
+  /* Extraer provincia y país de los address_components */
+  const comps     = result.address_components || [];
+  const provincia = comps.find(c => c.types.includes('administrative_area_level_1'))?.long_name || '';
+  const pais      = comps.find(c => c.types.includes('country'))?.short_name || '';
+
+  const geo = {
+    lat:      loc.lat(),
+    lon:      loc.lng(),
+    pais,
+    provincia,
+    /* Bounding box del viewport de Google: más preciso que Nominatim */
+    bbSW: { lat: viewport.getSouthWest().lat(), lon: viewport.getSouthWest().lng() },
+    bbNE: { lat: viewport.getNorthEast().lat(), lon: viewport.getNorthEast().lng() },
+    /* Radio máximo: diagonal del bbox / 2 + 20% de margen */
+    radioMaxKm: distKm(
+      viewport.getSouthWest().lat(), viewport.getSouthWest().lng(),
+      viewport.getNorthEast().lat(), viewport.getNorthEast().lng()
+    ) / 2 * 1.2
+  };
+
+  /* Asegurar radio mínimo de 8km y máximo de 60km */
+  geo.radioMaxKm = Math.max(8, Math.min(60, geo.radioMaxKm));
+
+  _geoCache.set(key, geo);
+  console.log('[Geo]', ciudad, '→', pais, provincia, '| radio:', geo.radioMaxKm.toFixed(1) + 'km');
+  return geo;
+}
+
+function estaDentroDelBoundingBox(lat, lon, geo) {
+  if (!lat || !lon) return null; /* sin coordenadas — no podemos validar */
+  return lat  >= geo.bbSW.lat && lat  <= geo.bbNE.lat &&
+         lon  >= geo.bbSW.lon && lon  <= geo.bbNE.lon;
+}
+
+/*
+ * Valida un resultado de Google Places contra la geo de la ciudad objetivo.
+ * Devuelve: { valido: bool, score: number, razon: string }
+ */
+function validarResultadoGeo(resultado, geo) {
+  const { lat, lon, direccion } = resultado;
+  const addr = normalizar(direccion || '');
+
+  /* ── Validación por país en formatted_address ─────────────────────
+   * Google siempre incluye el país en formatted_address.
+   * "Argentina" debe aparecer para resultados locales. */
+  const tieneArgentina = addr.includes('argentina');
+  const tieneEspana    = addr.includes('espana') || addr.includes('españa');
+  const tieneMexico    = addr.includes('mexico') || addr.includes('méxico');
+
+  if (tieneEspana || tieneMexico) {
+    return { valido: false, score: -1000, razon: 'País incorrecto: ' + direccion.split(',').pop().trim() };
+  }
+
+  /* Si no tiene Argentina pero sí otro país conocido → descartar */
+  const PAISES_ERRONEOS = ['spain', 'españa', 'mexico', 'colombia', 'chile',
+    'peru', 'perú', 'brasil', 'brazil', 'uruguay', 'paraguay', 'bolivia',
+    'venezuela', 'ecuador', 'united states', 'estados unidos'];
+  for (const p of PAISES_ERRONEOS) {
+    if (addr.includes(normalizar(p))) {
+      return { valido: false, score: -1000, razon: 'País incorrecto: ' + p };
+    }
+  }
+
+  /* ── Validación por distancia (si tiene coordenadas) ──────────────── */
+  if (lat && lon) {
+    const dist = distKm(geo.lat, geo.lon, lat, lon);
+
+    if (dist > geo.radioMaxKm) {
+      return {
+        valido: false,
+        score: -500,
+        razon: 'Distancia excesiva: ' + dist.toFixed(1) + 'km (máx ' + geo.radioMaxKm.toFixed(1) + 'km)'
+      };
+    }
+
+    /* ── Bounding box ─────────────────────────────────────────────── */
+    const enBbox = estaDentroDelBoundingBox(lat, lon, geo);
+    if (enBbox === false) {
+      return {
+        valido: false,
+        score: -200,
+        razon: 'Fuera del bounding box'
+      };
+    }
+
+    /* Score por distancia: más cerca = más score */
+    const scoreDistancia = Math.max(0, 100 - Math.round(dist * 10));
+
+    /* Score por provincia en dirección */
+    const scoreProvincia = addr.includes(normalizar(geo.provincia)) ? 50 : 0;
+
+    /* Score por Argentina */
+    const scorePais = tieneArgentina ? 20 : 0;
+
+    return {
+      valido: true,
+      score:  scoreDistancia + scoreProvincia + scorePais,
+      razon:  'OK · dist:' + dist.toFixed(1) + 'km'
+    };
+  }
+
+  /* Sin coordenadas — validar solo por dirección */
+  if (!tieneArgentina && addr.length > 10) {
+    /* Dirección existe pero no menciona Argentina → sospechoso */
+    return { valido: false, score: -100, razon: 'Sin Argentina en dirección: ' + direccion.slice(0, 40) };
+  }
+
+  /* Sin coordenadas y sin dirección clara — aceptar con score bajo */
+  return {
+    valido: true,
+    score:  tieneArgentina ? 20 : 5,
+    razon:  'Sin coords — aceptado por dirección'
+  };
+}
+
+/*
+ * Filtra y ordena una lista de resultados por validez geográfica.
+ * Descarta los inválidos, ordena los válidos por score geo + IUT.
+ */
+function filtrarPorGeo(resultados, geo, debugPrefix) {
+  const validos    = [];
+  let descartados  = 0;
+
+  for (const r of resultados) {
+    const check = validarResultadoGeo(r, geo);
+    if (check.valido) {
+      r._geoScore = check.score;
+      validos.push(r);
+      console.log('[GEO OK]', (debugPrefix || ''), r.nombre, '|', check.razon);
+    } else {
+      descartados++;
+      console.log('[GEO DESC]', (debugPrefix || ''), r.nombre, '|', check.razon);
+    }
+  }
+
+  if (descartados > 0) {
+    console.log('[GEO]', descartados, 'resultados descartados de', resultados.length);
+  }
+
+  /* Ordenar: score geográfico + IUT */
+  validos.sort((a, b) => (b._geoScore || 0) - (a._geoScore || 0));
+  return validos;
+}
+
 /* ── buscarGoogleQuery: acepta query completo (con zona incluida) ──── */
-async function buscarGoogleQuery(queryCompleto) {
+async function buscarGoogleQuery(queryCompleto, geo) {
   if (!state.gkey) throw new Error('Sin API Key');
   await cargarGoogleMapsAPI(state.gkey);
 
   const MAX_PAG      = 3;
   const DELAY_PAG_MS = 2500;
 
-  /* Service dedicado anclado al DOM */
   const searchDiv    = document.createElement('div');
   searchDiv.id       = '_radar_sq_' + Date.now();
   searchDiv.style.display = 'none';
@@ -2255,9 +2451,9 @@ async function buscarGoogleQuery(queryCompleto) {
   const service = new google.maps.places.PlacesService(searchDiv);
 
   const todosLosResultados = await new Promise((resolve) => {
-    let acumulados  = [];
-    let pagina      = 1;
-    let tid         = null;
+    let acumulados = [];
+    let pagina     = 1;
+    let tid        = null;
 
     function terminar() {
       clearTimeout(tid);
@@ -2285,7 +2481,8 @@ async function buscarGoogleQuery(queryCompleto) {
     service.textSearch({ query: queryCompleto }, procesarPagina);
   });
 
-  return todosLosResultados.map((r, i) => ({
+  /* Mapear resultados crudos */
+  const mapeados = todosLosResultados.map(r => ({
     nombre:    r.name,
     direccion: r.formatted_address || '',
     telefono:  '',
@@ -2298,6 +2495,13 @@ async function buscarGoogleQuery(queryCompleto) {
     googleId:  r.place_id,
     rating:    r.rating || 0
   }));
+
+  /* Filtrar geográficamente si tenemos la geo de la ciudad */
+  if (geo) {
+    return filtrarPorGeo(mapeados, geo, queryCompleto);
+  }
+
+  return mapeados;
 }
 
 /* ── Handler del botón BUSCAR ──────────────────────────────────────── */
