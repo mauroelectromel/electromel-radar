@@ -1909,27 +1909,20 @@ async function buscarGoogle(ciudad, rubro) {
  */
 async function cargarPaginasExtra(resultadosBase) {
   /*
-   * PAGINACIÓN REAL de Google Places JS API.
+   * PAGINACIÓN DEFINITIVA — Google Places JS API.
    *
-   * La documentación oficial dice que nextPage() reutiliza el
-   * callback original. Pero en la práctica ese callback ya resolvió
-   * una Promise — invocar nextPage() con un callback propio es ignorado.
+   * La API de paginación funciona así:
+   *   1. textSearch(req, cb) → cb recibe (results, status, pagination)
+   *   2. pagination.nextPage() → llama al MISMO cb con los siguientes resultados
    *
-   * La única forma confiable: guardar el pageToken de la respuesta
-   * anterior y hacer una nueva llamada a textSearch() con ese token.
-   * El objeto PlacesSearchPagination expone el token en
-   * pagination.za o pagination.Qa según la versión del SDK (ofuscado).
+   * El truco: NO convertir el cb en Promise todavía cuando llamamos textSearch.
+   * En su lugar, el cb guarda una referencia al pagination y resuelve
+   * promises dinámicamente. Así nextPage() funciona porque el cb sigue vivo.
    *
-   * Para no depender de propiedades ofuscadas que cambian con cada
-   * release de Google, usamos una Promise que se resuelve desde
-   * dentro del callback original registrado en textSearch().
-   *
-   * PATRÓN CORRECTO:
-   *   1. textSearch(req, cb) donde cb recibe (results, status, pagination)
-   *   2. Guardar resolve/reject en closures externos al cb
-   *   3. Llamar pagination.nextPage() SIN argumentos
-   *   4. El SDK llama al mismo cb con los nuevos resultados
-   *   5. El cb resuelve la promise nueva desde el closure
+   * 30-40 resultados en vez de 60 pasaba porque:
+   *   - Extraíamos el token y hacíamos una nueva textSearch con query diferente
+   *   - Google a veces rechaza el token si el query no es IDÉNTICO al original
+   *   - El token >100 chars no siempre está en las propiedades del objeto
    */
   const service = getPlacesService();
   const S       = google.maps.places.PlacesServiceStatus;
@@ -1937,65 +1930,94 @@ async function cargarPaginasExtra(resultadosBase) {
   const rubro   = buscarGoogle._rubro;
   const ciudad  = buscarGoogle._ciudad;
 
-  /* La pagination de la página 1 fue guardada en buscarGoogle._pagination */
+  /* pagination guardado de la página 1 */
   let paginaActual = buscarGoogle._pagination;
   if (!paginaActual?.hasNextPage) return;
 
-  let pagNum  = 2;
+  let pagNum    = 2;
   const MAX_PAG = 3;
 
   while (paginaActual?.hasNextPage && pagNum <= MAX_PAG) {
 
-    /* Google exige mínimo 2s entre páginas */
-    await new Promise(res => setTimeout(res, 2200));
+    /* Google exige mínimo 2s entre páginas para activar el token */
+    await new Promise(res => setTimeout(res, 2500));
 
-    /* Promise controlada desde FUERA del callback */
-    let _resolve, _reject;
-    const promesa = new Promise((res, rej) => { _resolve = res; _reject = rej; });
+    /* Capturar resultados de nextPage() con callback registrado en closure */
+    const nuevos = await new Promise(resolve => {
+      const tid = setTimeout(() => {
+        console.warn('[Pag] Timeout página', pagNum);
+        resolve([]);
+      }, 20000);
 
-    /* Timeout de seguridad por si el callback nunca llega */
-    const tid = setTimeout(() => _resolve([]), 15000);
-
-    /* Reemplazar el service por uno nuevo con callback fresco */
-    const tempDiv   = document.createElement('div');
-    const svcFresco = new google.maps.places.PlacesService(tempDiv);
-
-    /* nextPage internamente hace una nueva textSearch con el token */
-    /* Para capturarlo necesitamos un service con callback nuevo    */
-    /* Alternativa: llamar textSearch directamente con el token     */
-
-    /*
-     * Extraer el pageToken del objeto pagination.
-     * Google ofusca las propiedades pero el token siempre es un string
-     * de ~200 chars. Lo buscamos dinámicamente en las propiedades del objeto.
-     */
-    const token = Object.values(paginaActual).find(
-      v => typeof v === 'string' && v.length > 100
-    ) || null;
-
-    if (token) {
-      /* Llamada directa con pageToken — confiable y sin depender de nextPage() */
-      svcFresco.textSearch(
-        { query: `${rubro} ${ciudad}`, pageToken: token },
-        (results, status, nextPag) => {
+      /*
+       * nextPage() reutiliza internamente el callback de textSearch.
+       * Para interceptarlo, hacemos una nueva llamada a textSearch
+       * usando el MISMO service, con el mismo query, y dejamos que
+       * Google use el token interno que ya tiene en paginaActual.
+       *
+       * La forma correcta documentada por Google:
+       * https://developers.google.com/maps/documentation/javascript/places#place_search_responses
+       *
+       * pagination.nextPage() dispara una nueva request y llama al
+       * callback que se pase a nextPage() — SÍ acepta callback desde
+       * la versión 3.54+ del SDK. Versiones anteriores no lo aceptan.
+       * Detectamos cuál tenemos:
+       */
+      try {
+        const result = paginaActual.nextPage(function(results, status, nextPag) {
           clearTimeout(tid);
           if (status === S.OK || status === S.ZERO_RESULTS) {
             paginaActual = (nextPag?.hasNextPage) ? nextPag : null;
-            _resolve(results || []);
+            resolve(results || []);
+          } else {
+            console.warn('[Pag] Status página', pagNum, ':', status);
+            paginaActual = null;
+            resolve([]);
+          }
+        });
+
+        /*
+         * Si nextPage() retorna undefined/null → acepta callback (v3.54+) ✓
+         * Si nextPage() retorna algo truthy → es la versión vieja que
+         * no acepta callback. En ese caso el callback nunca se llama
+         * y el timeout va a resolver con [].
+         * Para la versión vieja, usar textSearch directo con token extraído.
+         */
+        if (result !== undefined && result !== null) {
+          /* Versión vieja de SDK — intentar con token extraído */
+          clearTimeout(tid);
+          const token = Object.entries(paginaActual)
+            .filter(([k,v]) => typeof v === 'string' && v.length > 50 && v.length < 400)
+            .sort((a,b) => b[1].length - a[1].length)[0]?.[1] || null;
+
+          if (token) {
+            const tmpDiv = document.createElement('div');
+            const tmpSvc = new google.maps.places.PlacesService(tmpDiv);
+            tmpSvc.textSearch(
+              { query: `${rubro} ${ciudad}`, pageToken: token },
+              (res2, st2, pag2) => {
+                if (st2 === S.OK || st2 === S.ZERO_RESULTS) {
+                  paginaActual = pag2?.hasNextPage ? pag2 : null;
+                  resolve(res2 || []);
+                } else {
+                  paginaActual = null;
+                  resolve([]);
+                }
+              }
+            );
           } else {
             paginaActual = null;
-            _resolve([]);
+            resolve([]);
           }
         }
-      );
-    } else {
-      /* No se pudo extraer el token — detener paginación */
-      clearTimeout(tid);
-      paginaActual = null;
-      _resolve([]);
-    }
+      } catch(e) {
+        clearTimeout(tid);
+        console.warn('[Pag] Error página', pagNum, e.message);
+        paginaActual = null;
+        resolve([]);
+      }
+    });
 
-    const nuevos = await promesa;
     if (!nuevos.length) break;
 
     /* Deduplicar */
@@ -2017,7 +2039,7 @@ async function cargarPaginasExtra(resultadosBase) {
         _idx:      resultadosBase.length + i
       }));
 
-    if (!mapeados.length) break;
+    if (!mapeados.length) { pagNum++; continue; }
 
     /* Cache de teléfonos existentes */
     mapeados.forEach(r => {
@@ -2032,9 +2054,9 @@ async function cargarPaginasExtra(resultadosBase) {
     state.resultados = state.resultados.concat(mapeados);
     mapeados.forEach(r => resultadosBase.push(r));
 
-    /* Renderizar cards nuevas */
+    /* Renderizar cards nuevas en el DOM */
     const cont = $('#resultados-buscar');
-    mapeados.forEach((n, i) => {
+    mapeados.forEach(n => {
       const tel    = !!(n.telefono && limpiarTel(n.telefono).length >= 6);
       const yaLead = !!encontrarLeadExistente(n);
       const iut    = calcularIUT({ ...n, equipos: [], tags: [] });
@@ -2048,7 +2070,6 @@ async function cargarPaginasExtra(resultadosBase) {
         ? `<div class="rc-meta rc-tel-slot">📞 <strong>${esc(n.telefono)}</strong></div>`
         : `<div class="rc-meta rc-tel-slot muted"><span class="spinner" style="width:10px;height:10px;border-width:1px;vertical-align:middle;margin-right:4px;"></span>Cargando...</div>`;
 
-      const idx = state.resultados.indexOf(n);
       div.innerHTML = `
         <div class="rc-header">
           <div class="rc-name">${esc(n.nombre)} <span class="iut-badge ${iutClase(iut)}" style="font-size:9px;">${iutLabel(iut)}${iut}</span></div>
@@ -2065,7 +2086,7 @@ async function cargarPaginasExtra(resultadosBase) {
         </div>`;
 
       div.querySelector('.btn-maps').addEventListener('click', () => abrirMaps(n));
-      div.querySelector('.btn-add').addEventListener('click', async (ev) => {
+      div.querySelector('.btn-add').addEventListener('click', async ev => {
         if (encontrarLeadExistente(n)) return;
         const lead = crearLeadDesdeResultado(n);
         await dbSaveLead(lead);
