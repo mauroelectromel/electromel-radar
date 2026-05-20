@@ -14,7 +14,7 @@
 
 'use strict';
 
-const CACHE_VERSION = 'electromel-radar-v6-r8';
+const CACHE_VERSION = 'electromel-radar-v6-r9';
 
 /* -----------------------------------------------------------------------
    Assets para pre-cachear en install.
