@@ -2805,7 +2805,9 @@ async function geocodificarCiudadGoogle(ciudad) {
 
   const result = await new Promise((resolve) => {
     geocoder.geocode(
-      { address: ciudad + ', Argentina' },
+      { address: ciudad + ', Argentina',
+        /* Componentes para forzar búsqueda en Argentina — evita ambigüedades */
+        componentRestrictions: { country: 'AR' } },
       (results, status) => {
         if (status === 'OK' && results.length) resolve(results[0]);
         else resolve(null);
@@ -2838,8 +2840,9 @@ async function geocodificarCiudadGoogle(ciudad) {
     ) / 2 * 1.2
   };
 
-  /* Asegurar radio mínimo de 8km y máximo de 60km */
-  geo.radioMaxKm = Math.max(8, Math.min(60, geo.radioMaxKm));
+  /* Radio mínimo 15km para ciudades (Neuquén ciudad tiene ~12km de radio útil)
+   * y máximo 80km para provincias/regiones. */
+  geo.radioMaxKm = Math.max(15, Math.min(80, geo.radioMaxKm));
 
   _geoCache.set(key, geo);
   console.log('[Geo]', ciudad, '→', pais, provincia, '| radio:', geo.radioMaxKm.toFixed(1) + 'km');
@@ -3022,9 +3025,17 @@ async function buscarGoogleQuery(queryCompleto, geo) {
     rating:    r.rating || 0
   }));
 
-  /* Filtrar geográficamente si tenemos la geo de la ciudad */
+  /* Filtrar geográficamente si tenemos la geo de la ciudad.
+   * Si geo es null (geocodificación falló), devolver sin filtrar
+   * para no perder resultados válidos por un error de geocoding. */
   if (geo) {
-    return filtrarPorGeo(mapeados, geo, queryCompleto);
+    const filtrados = filtrarPorGeo(mapeados, geo, queryCompleto);
+    /* Seguridad: si el filtro descartó todo y había resultados, devolver sin filtrar */
+    if (filtrados.length === 0 && mapeados.length > 0) {
+      console.warn('[GEO] Filtro descartó todos los resultados — devolviendo sin filtrar');
+      return mapeados;
+    }
+    return filtrados;
   }
 
   return mapeados;
@@ -3156,17 +3167,29 @@ $('#btn-buscar').addEventListener('click', async () => {
   const ciudad = $('#inp-ciudad').value.trim();
   const fuente = $('#inp-fuente').value;
 
-  /* Recolectar rubros: chips activos + lo que haya en el input */
+  /* Recolectar rubros — tres fuentes posibles:
+     1. Chips activos (_rubrosActivos)
+     2. Texto en el input (separado por comas o solo)
+     3. Combinación de ambos */
   const inputVal = $('#inp-rubro').value.trim();
+
+  /* Agregar lo que haya en el input a los chips */
   if (inputVal) {
     parsearRubrosDelInput(inputVal).forEach(agregarRubro);
     $('#inp-rubro').value = '';
   }
 
-  /* Si no hay chips ni input, usar el valor del input directamente */
   let rubros = [..._rubrosActivos];
-  if (!rubros.length && inputVal) rubros = parsearRubrosDelInput(inputVal);
-  if (!rubros.length) { toast('Ingresá al menos un rubro'); return; }
+
+  /* Si sigue vacío después de procesar, intentar con el inputVal original */
+  if (!rubros.length && inputVal) {
+    rubros = parsearRubrosDelInput(inputVal);
+  }
+
+  if (!rubros.length) {
+    toast('Escribí un rubro o elegí uno de los sugeridos');
+    return;
+  }
   if (!ciudad && !buscarTodaZona) { toast('Ingresá una ciudad'); return; }
 
   const ciudades = buscarTodaZona ? CIUDADES_ZONA : [ciudad];
@@ -3267,6 +3290,11 @@ $('#btn-buscar').addEventListener('click', async () => {
   if (state.resultados.some(r => r.fuente === 'google')) {
     setTimeout(() => lanzarEnriquecimiento(state.resultados), 500);
   }
+
+  /* Limpiar rubros activos para la próxima búsqueda */
+  _rubrosActivos = [];
+  $$('#rubros-sugeridos .filtro-btn').forEach(b => b.classList.remove('active'));
+  actualizarChipsRubros();
 
   $('#btn-buscar').disabled = false;
 });
