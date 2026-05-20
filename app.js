@@ -1325,126 +1325,319 @@ async function abrirWhatsApp(lead, tipo) {
 
 /* ======================================================================
    21. BÚSQUEDA OSM / GOOGLE
+   ======================================================================
+
+   OSM: usa Nominatim (geocoding) + Overpass (POIs).
+     - Nominatim devuelve boundingbox como [S, N, W, E].
+     - Overpass espera (S, W, N, E) — el orden importa.
+     - User-Agent requerido por la política de Nominatim.
+     - Tres servidores Overpass en fallback.
+
+   GOOGLE: la API REST Places bloquea CORS desde el browser.
+     - Solución correcta: Maps JavaScript API cargada dinámicamente
+       solo cuando el usuario tiene API Key configurada.
+     - Se usa PlacesService con un div temporal (requerido por la API).
+     - Sin API Key muestra instrucciones claras.
    ====================================================================== */
-const OVERPASS = [
+
+/* Fetch con timeout */
+async function fetchTout(url, opts={}, ms=25000) {
+  const ctrl = new AbortController();
+  const tid  = setTimeout(() => ctrl.abort(), ms);
+  try   { return await fetch(url, { ...opts, signal: ctrl.signal }); }
+  finally { clearTimeout(tid); }
+}
+
+/* ── Nominatim geocoding ────────────────────────────────────────────── */
+async function geocodeCiudad(ciudad) {
+  /* Nominatim requiere User-Agent identificable — sin él devuelve 403 */
+  const headers = {
+    'Accept':     'application/json',
+    'User-Agent': 'ElectromelRadar/6 (contacto@electromel.com.ar)'
+  };
+
+  const url = `https://nominatim.openstreetmap.org/search`
+    + `?q=${encodeURIComponent(ciudad)}`
+    + `&format=json&limit=1&addressdetails=0`;
+
+  let res, data;
+  try {
+    res  = await fetchTout(url, { headers }, 15000);
+    data = await res.json();
+  } catch(e) {
+    throw new Error(`Geocoding falló: ${e.message}`);
+  }
+
+  if (!Array.isArray(data) || !data.length) {
+    throw new Error(`Ciudad no encontrada: "${ciudad}"`);
+  }
+
+  const r = data[0];
+  /* boundingbox de Nominatim: [S, N, W, E] */
+  const bb = r.boundingbox.map(parseFloat); // [S, N, W, E]
+  return {
+    lat: parseFloat(r.lat),
+    lon: parseFloat(r.lon),
+    /* Overpass bbox: S, W, N, E */
+    bboxOvp: `${bb[0]},${bb[2]},${bb[1]},${bb[3]}`
+  };
+}
+
+/* ── Overpass / OSM ────────────────────────────────────────────────── */
+const OVERPASS_SERVERS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
   'https://overpass.private.coffee/api/interpreter'
 ];
-const NOMINATIM = ['https://nominatim.openstreetmap.org/search'];
 
-async function fetchTout(url, opts={}, ms=25000) {
-  const ctrl = new AbortController();
-  const tid  = setTimeout(() => ctrl.abort(), ms);
-  try { return await fetch(url, { ...opts, signal: ctrl.signal }); }
-  finally { clearTimeout(tid); }
-}
-
-async function geocodeCiudad(ciudad) {
-  for (const s of NOMINATIM) {
-    try {
-      const res  = await fetchTout(`${s}?q=${encodeURIComponent(ciudad)}&format=json&limit=1`, { headers: {'Accept':'application/json'} }, 15000);
-      const data = await res.json();
-      if (!data?.length) continue;
-      const r = data[0];
-      return { lat: parseFloat(r.lat), lon: parseFloat(r.lon), bbox: r.boundingbox.map(parseFloat) };
-    } catch { continue; }
-  }
-  throw new Error('No se pudo geocodificar: ' + ciudad);
+function buildOverpassQuery(rubro, bbox) {
+  /* Escapar caracteres especiales para regex Overpass */
+  const r = rubro.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  /* Buscar por nombre del lugar Y por categorías comunes */
+  return `[out:json][timeout:30];
+(
+  nwr["name"~"${r}",i](${bbox});
+  nwr["shop"~"${r}",i](${bbox});
+  nwr["amenity"~"${r}",i](${bbox});
+  nwr["leisure"~"${r}",i](${bbox});
+  nwr["tourism"~"${r}",i](${bbox});
+  nwr["industrial"~"${r}",i](${bbox});
+  nwr["craft"~"${r}",i](${bbox});
+);
+out center tags 80;`;
 }
 
 async function buscarOSM(ciudad, rubro) {
-  const geo = await geocodeCiudad(ciudad);
-  const bb  = `${geo.bbox[0]},${geo.bbox[2]},${geo.bbox[1]},${geo.bbox[3]}`;
-  const r   = rubro.trim().replace(/"/g,'');
-  const q   = `[out:json][timeout:25];\n(\n  nwr["name"~"${r}",i](${bb});\n  node["shop"~"${r}",i](${bb});\n  node["amenity"~"${r}",i](${bb});\n  node["leisure"~"${r}",i](${bb});\n  node["tourism"~"${r}",i](${bb});\n  node["industrial"~"${r}",i](${bb});\n);\nout center tags 60;`;
-
-  let data, lastErr;
-  for (const s of OVERPASS) {
-    try {
-      const res = await fetchTout(s, { method:'POST', body:'data='+encodeURIComponent(q), headers:{'Content-Type':'application/x-www-form-urlencoded'} }, 30000);
-      if (!res.ok) { lastErr = new Error('HTTP '+res.status); continue; }
-      data = await res.json(); break;
-    } catch(e) { lastErr = e; continue; }
+  /* 1. Geocodificar la ciudad */
+  let geo;
+  try {
+    geo = await geocodeCiudad(ciudad);
+  } catch(e) {
+    throw new Error(`OSM: ${e.message}`);
   }
-  if (!data) throw new Error('OSM no disponible: ' + lastErr?.message);
 
-  return (data.elements||[]).filter(e => (e.tags||{}).name).slice(0,60).map(e => {
-    const t = e.tags || {};
-    return {
-      nombre:    t.name,
-      direccion: [t['addr:street'],t['addr:housenumber'],t['addr:city']].filter(Boolean).join(' '),
-      telefono:  t.phone||t['contact:phone']||t['contact:mobile']||'',
-      web:       t.website||t['contact:website']||'',
-      lat:       e.lat||(e.center?.lat),
-      lon:       e.lon||(e.center?.lon),
-      tipo:      t.shop||t.tourism||t.leisure||t.amenity||t.craft||'',
-      rubro:     detectarRubro(t.shop||t.tourism||t.leisure||t.amenity||''),
-      fuente:    'osm', osmId: e.id
+  const q = buildOverpassQuery(rubro, geo.bboxOvp);
+
+  /* 2. Intentar cada servidor Overpass */
+  let data = null, lastErr = null;
+
+  for (const server of OVERPASS_SERVERS) {
+    try {
+      const res = await fetchTout(
+        server,
+        {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body:    'data=' + encodeURIComponent(q)
+        },
+        35000
+      );
+      if (!res.ok) {
+        lastErr = new Error(`Servidor devolvió HTTP ${res.status}`);
+        continue;
+      }
+      data = await res.json();
+      break;
+    } catch(e) {
+      lastErr = e;
+      continue;
+    }
+  }
+
+  if (!data) {
+    throw new Error(`Overpass no disponible: ${lastErr?.message || 'sin respuesta'}`);
+  }
+
+  /* 3. Parsear resultados */
+  return (data.elements || [])
+    .filter(e => (e.tags || {}).name)
+    .slice(0, 80)
+    .map(e => {
+      const t = e.tags || {};
+      const lat = e.lat ?? e.center?.lat ?? null;
+      const lon = e.lon ?? e.center?.lon ?? null;
+      return {
+        nombre:    t.name,
+        direccion: [t['addr:street'], t['addr:housenumber'], t['addr:city']]
+                    .filter(Boolean).join(' '),
+        telefono:  t.phone || t['contact:phone'] || t['contact:mobile'] || '',
+        web:       t.website || t['contact:website'] || '',
+        lat, lon,
+        tipo:  t.shop || t.tourism || t.leisure || t.amenity || t.craft || '',
+        rubro: detectarRubro(t.shop || t.tourism || t.leisure || t.amenity || ''),
+        fuente: 'osm',
+        osmId:  e.id
+      };
+    });
+}
+
+/* ── Google Places (Maps JavaScript API) ───────────────────────────── */
+/*
+   La API REST de Places bloquea CORS desde el browser por diseño de Google.
+   La única forma correcta de llamarla desde el browser es con la
+   Maps JavaScript API, que se carga dinámicamente con la key del usuario.
+*/
+let _googleMapsLoaded = false;
+let _googleMapsLoading = false;
+let _googleMapsCallbacks = [];
+
+function cargarGoogleMapsAPI(key) {
+  return new Promise((resolve, reject) => {
+    if (_googleMapsLoaded) { resolve(); return; }
+
+    _googleMapsCallbacks.push({ resolve, reject });
+    if (_googleMapsLoading) return;
+    _googleMapsLoading = true;
+
+    /* Callback global que Google llama cuando termina de cargar */
+    window._radarGMapsReady = () => {
+      _googleMapsLoaded  = true;
+      _googleMapsLoading = false;
+      _googleMapsCallbacks.forEach(cb => cb.resolve());
+      _googleMapsCallbacks = [];
     };
+
+    const script  = document.createElement('script');
+    script.src    = `https://maps.googleapis.com/maps/api/js?key=${key}&libraries=places&callback=_radarGMapsReady`;
+    script.async  = true;
+    script.onerror = () => {
+      _googleMapsLoading = false;
+      const err = new Error('No se pudo cargar Google Maps API. Verificá la API Key y que tenga habilitada "Maps JavaScript API" y "Places API".');
+      _googleMapsCallbacks.forEach(cb => cb.reject(err));
+      _googleMapsCallbacks = [];
+    };
+    document.head.appendChild(script);
   });
 }
 
 async function buscarGoogle(ciudad, rubro) {
-  if (!state.gkey) throw new Error('Falta API Key de Google Places en Config.');
-  const url  = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(rubro+' '+ciudad)}&key=${state.gkey}`;
-  const res  = await fetchTout(url, {}, 20000);
-  const data = await res.json();
-  if (data.status!=='OK' && data.status!=='ZERO_RESULTS') throw new Error('Google: '+data.status);
-  return (data.results||[]).map(r => ({
+  if (!state.gkey) {
+    throw new Error(
+      'Configurá tu API Key en la pestaña CONFIG. ' +
+      'Necesitás habilitar "Maps JavaScript API" y "Places API" en Google Cloud Console.'
+    );
+  }
+
+  /* Cargar la Maps JS API si no está cargada todavía */
+  try {
+    await cargarGoogleMapsAPI(state.gkey);
+  } catch(e) {
+    throw new Error(e.message);
+  }
+
+  /* Geocodificar la ciudad con Google para obtener coordenadas */
+  const geocoder = new google.maps.Geocoder();
+  const geoResult = await new Promise((resolve, reject) => {
+    geocoder.geocode({ address: ciudad + ', Argentina' }, (results, status) => {
+      if (status === 'OK' && results.length) resolve(results[0]);
+      else reject(new Error(`Google no encontró la ciudad "${ciudad}" (${status})`));
+    });
+  });
+
+  const location = geoResult.geometry.location;
+
+  /* PlacesService requiere un elemento del DOM */
+  const tempDiv = document.createElement('div');
+  const service = new google.maps.places.PlacesService(tempDiv);
+
+  const request = {
+    query:    `${rubro} ${ciudad}`,
+    location: location,
+    radius:   15000
+  };
+
+  const places = await new Promise((resolve, reject) => {
+    service.textSearch(request, (results, status) => {
+      if (status === google.maps.places.PlacesServiceStatus.OK ||
+          status === google.maps.places.PlacesServiceStatus.ZERO_RESULTS) {
+        resolve(results || []);
+      } else {
+        reject(new Error(
+          `Google Places devolvió: ${status}. ` +
+          `Verificá que tu Key tenga habilitada "Places API".`
+        ));
+      }
+    });
+  });
+
+  return places.map(r => ({
     nombre:    r.name,
-    direccion: r.formatted_address||'',
+    direccion: r.formatted_address || '',
     telefono:  '',
     web:       '',
-    lat:       r.geometry?.location?.lat||null,
-    lon:       r.geometry?.location?.lng||null,
-    tipo:      (r.types||[])[0]||'',
-    rubro:     detectarRubro((r.types||[])[0]||''),
-    fuente:    'google', googleId: r.place_id, rating: r.rating||0
+    lat:       r.geometry?.location?.lat() ?? null,
+    lon:       r.geometry?.location?.lng() ?? null,
+    tipo:      (r.types || [])[0] || '',
+    rubro:     detectarRubro((r.types || [])[0] || ''),
+    fuente:    'google',
+    googleId:  r.place_id,
+    rating:    r.rating || 0
   }));
 }
 
+/* ── Handler del botón BUSCAR ──────────────────────────────────────── */
 let buscarTodaZona = false;
 
 $('#btn-buscar').addEventListener('click', async () => {
   const ciudad = $('#inp-ciudad').value.trim();
   const rubro  = $('#inp-rubro').value.trim();
   const fuente = $('#inp-fuente').value;
+
   if (!ciudad && !buscarTodaZona) { toast('Ingresá una ciudad'); return; }
   if (!rubro)                     { toast('Ingresá el tipo de negocio'); return; }
 
   const ciudades = buscarTodaZona ? CIUDADES_ZONA : [ciudad];
-  $('#buscar-info').innerHTML = `<span class="spinner"></span> Buscando ${rubro} en ${ciudades.length>1?ciudades.length+' ciudades':ciudad}...`;
+
+  const info = $('#buscar-info');
+  info.innerHTML = `<span class="spinner"></span> Buscando <b>${esc(rubro)}</b> en ${ciudades.length > 1 ? ciudades.length + ' ciudades' : '<b>' + esc(ciudad) + '</b>'}...`;
   $('#btn-buscar').disabled = true;
   $('#resultados-buscar').innerHTML = '';
 
-  try {
-    let resultados = [];
-    for (const c of ciudades) {
-      try {
-        const res = fuente==='google' ? await buscarGoogle(c, rubro) : await buscarOSM(c, rubro);
-        resultados = resultados.concat(res);
-      } catch(e) { console.warn('[Buscar]', c, e.message); }
+  const errores = [];
+  let resultados = [];
+
+  for (const c of ciudades) {
+    info.innerHTML = `<span class="spinner"></span> Buscando en <b>${esc(c)}</b>...`;
+    try {
+      const res = fuente === 'google'
+        ? await buscarGoogle(c, rubro)
+        : await buscarOSM(c, rubro);
+      resultados = resultados.concat(res);
+    } catch(e) {
+      errores.push(`${c}: ${e.message}`);
     }
+  }
 
-    const vistos = new Set();
-    resultados = resultados.filter(r => {
-      const k = normalizar(r.nombre)+'|'+normalizar(r.direccion).slice(0,20);
-      if (vistos.has(k)) return false;
-      vistos.add(k); return true;
-    });
+  /* Deduplicar */
+  const vistos = new Set();
+  resultados = resultados.filter(r => {
+    const k = normalizar(r.nombre) + '|' + normalizar(r.direccion || '').slice(0, 20);
+    if (vistos.has(k)) return false;
+    vistos.add(k);
+    return true;
+  });
 
-    resultados.forEach(r => { r.iut = calcularIUT({ ...r, equipos:[], tags:[] }); });
-    resultados.sort((a,b) => b.iut-a.iut || (b.rating||0)-(a.rating||0));
-    state.resultados = resultados;
+  /* Calcular IUT y ordenar */
+  resultados.forEach(r => { r.iut = calcularIUT({ ...r, equipos: [], tags: [] }); });
+  resultados.sort((a, b) => b.iut - a.iut || (b.rating || 0) - (a.rating || 0));
+  state.resultados = resultados;
 
-    $('#buscar-info').textContent = resultados.length
-      ? `${resultados.length} objetivo(s) encontrado(s)`
-      : 'Sin resultados. Probá otro rubro.';
+  /* Mostrar resultado o error claro */
+  if (resultados.length) {
+    info.textContent = `${resultados.length} objetivo(s) encontrado(s)`;
+  } else if (errores.length) {
+    /* Error visible en pantalla, no solo en consola */
+    info.innerHTML = `
+      <div style="background:rgba(255,51,85,0.1);border:1px solid rgba(255,51,85,0.3);border-radius:8px;padding:10px;margin-top:6px;font-size:12px;color:var(--red);">
+        <b>⚠️ Error en la búsqueda:</b><br>
+        ${errores.map(e => esc(e)).join('<br>')}
+      </div>`;
+  } else {
+    info.textContent = 'Sin resultados. Probá con otro término o ciudad.';
+  }
 
-    renderResultados(resultados);
-    renderMapResults(resultados);
-  } catch(e) { $('#buscar-info').textContent = '⚠️ ' + e.message; }
+  renderResultados(resultados);
+  if (resultados.length) renderMapResults(resultados);
 
   $('#btn-buscar').disabled = false;
 });
