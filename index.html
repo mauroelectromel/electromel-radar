@@ -365,9 +365,42 @@
 
     <!-- ======= TERRENO ======= -->
     <div id="sec-terreno" class="panel-sec">
+
+      <!-- PANEL ARRANCAR DÍA — se muestra/oculta dinámicamente -->
+      <div id="panel-arrancar-dia" style="display:none;
+           background:var(--bg-panel);border:1px solid var(--border-lit);
+           border-left:3px solid var(--em-orange);border-radius:var(--r);
+           padding:12px;margin-bottom:10px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+          <div style="font-family:var(--cond);font-size:15px;font-weight:800;
+                      color:var(--em-orange);letter-spacing:0.5px;">
+            ⚡ ARRANCAR DÍA
+          </div>
+          <button id="btn-cerrar-arrancar" class="btn btn-sm"
+                  style="padding:4px 8px;min-height:28px;font-size:11px;">✕</button>
+        </div>
+
+        <!-- Resumen del día -->
+        <div id="dia-resumen" style="display:grid;grid-template-columns:repeat(3,1fr);
+             gap:6px;margin-bottom:10px;"></div>
+
+        <!-- Objetivos sugeridos -->
+        <div style="font-size:10px;font-weight:700;font-family:var(--mono);
+                    color:var(--text-dim);letter-spacing:1px;margin-bottom:6px;">
+          OBJETIVOS SUGERIDOS HOY
+        </div>
+        <div id="dia-objetivos"></div>
+
+        <!-- Botones de acción -->
+        <div class="row-2" style="margin-top:10px;">
+          <button class="btn btn-sm" id="btn-dia-regenerar">↺ REGENERAR</button>
+          <button class="btn btn-em" id="btn-dia-iniciar">INICIAR RECORRIDO</button>
+        </div>
+      </div>
+
       <div class="sec-header">
         <div class="sec-title">DETECCIÓN TÉCNICA ACTIVA</div>
-        <button id="btn-ir-hoy" class="btn btn-em btn-sm">RUTA HOY</button>
+        <button id="btn-ir-hoy" class="btn btn-em btn-sm">⚡ ARRANCAR DÍA</button>
       </div>
       <div id="terreno-status"
            class="muted"
@@ -404,6 +437,23 @@
                type="text"
                placeholder="gym, hotel, metalurgica, soldadora, taller..."
                autocomplete="off">
+        <!-- Chips de rubros activos -->
+        <div id="rubros-chips" style="display:none;flex-wrap:wrap;gap:5px;margin-top:8px;"></div>
+        <!-- Rubros frecuentes de ELECTROMEL -->
+        <div style="margin-top:8px;">
+          <div style="font-size:10px;color:var(--text-dim);font-family:var(--mono);
+                      letter-spacing:0.5px;margin-bottom:5px;">RUBROS FRECUENTES:</div>
+          <div style="display:flex;flex-wrap:wrap;gap:4px;" id="rubros-sugeridos">
+            <button class="filtro-btn" data-rubro="taller">⚙️ Taller</button>
+            <button class="filtro-btn" data-rubro="metalurgica">🏭 Metalúrgica</button>
+            <button class="filtro-btn" data-rubro="soldadora">⚡ Soldadora</button>
+            <button class="filtro-btn" data-rubro="gym">🏋️ Gym</button>
+            <button class="filtro-btn" data-rubro="hotel">🏨 Hotel</button>
+            <button class="filtro-btn" data-rubro="constructora">🏗️ Constructora</button>
+            <button class="filtro-btn" data-rubro="lavadero">🌀 Lavadero</button>
+            <button class="filtro-btn" data-rubro="industrial">🔧 Industrial</button>
+          </div>
+        </div>
       </div>
 
       <div class="field">
@@ -419,6 +469,13 @@
            class="muted"
            style="margin-top:8px;text-align:center;font-family:var(--mono);font-size:11px;"></div>
       <hr>
+      <!-- Barra de acciones masivas — visible solo cuando hay resultados -->
+      <div id="barra-acciones-resultados"
+           style="display:none;align-items:center;gap:6px;
+                  background:var(--bg-panel);border:1px solid var(--border-lit);
+                  border-radius:var(--r);padding:8px 10px;margin-bottom:10px;
+                  flex-wrap:wrap;">
+      </div>
       <div id="resultados-buscar"></div>
     </div>
 
@@ -520,15 +577,31 @@
       <div id="stats-equipos" style="margin-bottom:14px;"></div>
       <hr>
       <div style="font-size:13px;font-weight:800;margin-bottom:8px;font-family:var(--cond);letter-spacing:0.5px;">
+        CONVERSIONES POR RUBRO
+      </div>
+      <div id="stats-conversiones" style="margin-bottom:14px;"></div>
+      <hr>
+      <div style="font-size:13px;font-weight:800;margin-bottom:8px;font-family:var(--cond);letter-spacing:0.5px;">
+        ALERTAS DE REVISITA
+      </div>
+      <div id="stats-revisitas" style="margin-bottom:14px;"></div>
+      <hr>
+      <div style="font-size:13px;font-weight:800;margin-bottom:8px;font-family:var(--cond);letter-spacing:0.5px;">
         BACKUPS Y DATOS
       </div>
+      <button class="btn btn-b btn-block" id="btn-exportar-wa" style="margin-bottom:8px;">
+        📱 CAMPAÑA WHATSAPP
+      </button>
+      <button class="btn btn-g btn-block" id="btn-exportar-avanzado" style="margin-bottom:8px;">
+        ⬇ EXPORTAR / SINCRONIZAR
+      </button>
       <div class="row-2" style="margin-bottom:8px;">
-        <button class="btn btn-sm" id="btn-exportar">EXPORTAR JSON</button>
-        <button class="btn btn-sm" id="btn-importar">IMPORTAR JSON</button>
+        <button class="btn btn-sm" id="btn-exportar">JSON completo</button>
+        <button class="btn btn-sm" id="btn-importar">IMPORTAR</button>
       </div>
       <div id="lista-backups" style="margin-bottom:8px;"></div>
       <button class="btn btn-r btn-block btn-sm" id="btn-borrar-todo">BORRAR TODO</button>
-      <input type="file" id="file-import" accept=".json" style="display:none;">
+      <input type="file" id="file-import" accept=".json,.csv" style="display:none;">
     </div>
 
     <!-- ======= CONFIG ======= -->
