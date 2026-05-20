@@ -3138,7 +3138,19 @@ function initMultiRubro() {
 }
 
 /* ── Handler del botón BUSCAR ──────────────────────────────────────── */
-let buscarTodaZona = false;
+let buscarTodaZona   = false;
+let _buscarCancelado = false;  /* flag de cancelación */
+
+$('#btn-frenar').addEventListener('click', () => {
+  _buscarCancelado = true;
+  $('#btn-frenar').style.display = 'none';
+  $('#btn-buscar').disabled = false;
+  const info = $('#buscar-info');
+  if (info) info.innerHTML =
+    '⏹ Búsqueda cancelada · ' +
+    '<b style="color:var(--accent);">' + state.resultados.length + '</b> resultado(s) hasta ahora';
+  toast('Búsqueda cancelada');
+});
 
 $('#btn-buscar').addEventListener('click', async () => {
   const ciudad = $('#inp-ciudad').value.trim();
@@ -3170,6 +3182,8 @@ $('#btn-buscar').addEventListener('click', async () => {
     '<b>' + totalCombinaciones + '</b> campañas...';
 
   $('#btn-buscar').disabled = true;
+  $('#btn-frenar').style.display = 'flex';
+  _buscarCancelado = false;
   cont.innerHTML = '';
   state.resultados = [];
   _filtrarYaGuardados = false;
@@ -3179,8 +3193,10 @@ $('#btn-buscar').addEventListener('click', async () => {
   let rubroActual    = 0;
 
   for (const rubro of rubros) {
+    if (_buscarCancelado) break;
     rubroActual++;
     for (const c of ciudades) {
+      if (_buscarCancelado) break;
       try {
         const parciales = await buscarMultiZona(c, rubro, fuente, (prog) => {
           const elapsed  = Math.round((Date.now() - tsInicio) / 1000);
@@ -3230,6 +3246,10 @@ $('#btn-buscar').addEventListener('click', async () => {
       }
     }
   }
+
+  /* Ocultar botón frenar al terminar */
+  $('#btn-frenar').style.display = 'none';
+  _buscarCancelado = false;
 
   /* Resumen final */
   const elapsed = Math.round((Date.now() - tsInicio) / 1000);
@@ -3385,6 +3405,9 @@ function renderResultados(lista) {
           (yaLead ? 'disabled style="opacity:0.5;"' : '') + '>' +
           (yaLead ? '✓ GUARDADO' : '+ GUARDAR') +
         '</button>' +
+        /* Botón eliminar — solo visible si ya está guardado */
+        (yaLead ? '<button class="btn btn-sm btn-r" data-rc-del="' + n._idx + '" ' +
+          'title="Eliminar este lead" style="padding:7px 10px;min-height:34px;">🗑</button>' : '') +
       '</div>' +
     '</div>';
   }).join('');
@@ -3418,6 +3441,32 @@ function renderResultados(lista) {
       let lead = encontrarLeadExistente(n);
       if (!lead) { lead = crearLeadDesdeResultado(n); await dbSaveLead(lead); }
       abrirWhatsApp(lead, 'primero');
+    });
+  });
+
+  /* FIX 3: Eliminar lead guardado desde la lista de resultados */
+  cont.querySelectorAll('[data-rc-del]').forEach(b => {
+    b.addEventListener('click', async () => {
+      const n    = state.resultados[+b.dataset.rcDel];
+      if (!n) return;
+      const lead = encontrarLeadExistente(n);
+      if (!lead) return;
+      if (!confirm('¿Eliminar "' + lead.nombre + '"?')) return;
+      await dbDeleteLead(lead.id);
+      /* Quitar marker del mapa */
+      const m = _leadMarkersMap.get(lead.id);
+      if (m) { map.removeLayer(m); _leadMarkersMap.delete(lead.id); }
+      /* Actualizar la card visualmente sin re-render completo */
+      const card    = b.closest('.result-card');
+      const addBtn  = card?.querySelector('[data-rc-add]');
+      if (addBtn) {
+        addBtn.textContent = '+ GUARDAR';
+        addBtn.disabled    = false;
+        addBtn.classList.add('btn-em');
+      }
+      b.remove(); /* quitar botón eliminar */
+      renderBotonesAccionMasiva();
+      toast('Lead eliminado');
     });
   });
 }
@@ -4400,11 +4449,16 @@ $('#inp-ciudad').addEventListener('input', e => {
 $('#inp-ciudad').addEventListener('blur', () =>
   setTimeout(() => $('#ciudad-suggest').classList.remove('show'), 150));
 
+/* FIX: toda la zona OFF por defecto — solo se activa manualmente */
+buscarTodaZona = false;
+$('#toggle-zona').classList.remove('active');
+
 $('#toggle-zona').addEventListener('click', () => {
   buscarTodaZona = !buscarTodaZona;
   $('#toggle-zona').classList.toggle('active', buscarTodaZona);
-  $('#inp-ciudad').disabled    = buscarTodaZona;
+  $('#inp-ciudad').disabled      = buscarTodaZona;
   $('#inp-ciudad').style.opacity = buscarTodaZona ? '0.4' : '1';
+  if (buscarTodaZona) toast('Modo zona completa: ' + CIUDADES_ZONA.length + ' ciudades');
 });
 
 /* ======================================================================
