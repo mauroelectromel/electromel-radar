@@ -304,7 +304,7 @@ html, body {
 #bottom-panel.half     { transform: translateY(calc(100% - 200px)); }
 
 #panel-handle {
-  padding: 10px 10px 6px;
+  padding: 14px 10px 10px;   /* más alto = zona táctil más grande */
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -312,6 +312,22 @@ html, body {
   cursor: pointer;
   flex-shrink: 0;
   border-bottom: 1px solid var(--border);
+  /* Área táctil extendida hacia arriba sin afectar el layout */
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* La rayita se hace más visible y más ancha para facilitar el agarre */
+.handle-bar {
+  width: 48px;
+  height: 5px;
+  background: var(--border-hot);
+  border-radius: 3px;
+  transition: background 0.15s;
+}
+#panel-handle:active .handle-bar {
+  background: var(--accent);
 }
 
 .handle-bar {
