@@ -1811,7 +1811,20 @@ function getPlacesService() {
   return _placesService;
 }
 
-/* ── buscarGoogle principal ───────────────────────────────────────── */
+/* ── buscarGoogle + paginación completa ───────────────────────────── */
+/*
+ * DISEÑO CORRECTO de paginación Google Places JS API:
+ *
+ * El error de todas las versiones anteriores era envolver textSearch()
+ * en una Promise. Cuando resolve() se ejecuta, el callback muere.
+ * nextPage() intenta reusar ese mismo callback — pero ya no existe.
+ * Resultado: nextPage() se ejecuta pero nadie recibe los resultados.
+ *
+ * SOLUCIÓN: un único callback persistente que maneja TODAS las páginas.
+ * El callback no vive dentro de una Promise — vive en el closure de
+ * buscarGoogle() y se llama múltiples veces (una por página).
+ * Cada vez que se llama, encola los resultados y decide si pedir más.
+ */
 async function buscarGoogle(ciudad, rubro) {
   if (!state.gkey) {
     throw new Error(
@@ -1829,7 +1842,7 @@ async function buscarGoogle(ciudad, rubro) {
       { address: ciudad + ', Argentina' },
       (results, status) => {
         if (status === 'OK' && results.length) resolve(results[0]);
-        else reject(new Error(`Google no encontró "${ciudad}" (${status})`));
+        else reject(new Error('Google no encontró "' + ciudad + '" (' + status + ')'));
       }
     );
   });
@@ -1838,39 +1851,73 @@ async function buscarGoogle(ciudad, rubro) {
   const location = geoResult.geometry.location;
 
   /*
-   * textSearch — página 1 inmediata (20 resultados).
-   *
-   * IMPORTANTE sobre paginación de Google Places JS API:
-   * nextPage() NO acepta callback propio — reutiliza el callback
-   * original de textSearch(). Envolver nextPage() en una Promise
-   * propia causa que la promesa nunca resuelva (el callback original
-   * ya fue consumido). Por eso la paginación se maneja en background
-   * DESPUÉS de mostrar los primeros resultados.
+   * Paginación con callback persistente.
+   * resolve() se llama UNA SOLA VEZ, después de que TODAS las páginas
+   * llegaron o después de un timeout total.
    */
-  const places = await new Promise((resolve, reject) => {
+  const MAX_PAG      = 3;
+  const DELAY_PAG_MS = 2500; /* Google exige ~2s entre páginas */
+
+  const todosLosResultados = await new Promise((resolve) => {
+    let acumulados  = [];
+    let pagina      = 1;
+    let timeoutGral = null;
+
+    /* Timeout global: si en 30s no terminó, devolver lo que hay */
+    timeoutGral = setTimeout(() => {
+      console.warn('[Pag] Timeout global — devolviendo', acumulados.length, 'resultados');
+      resolve(acumulados);
+    }, 30000);
+
+    function procesarPagina(results, status, pagination) {
+      if (status === google.maps.places.PlacesServiceStatus.OK ||
+          status === google.maps.places.PlacesServiceStatus.ZERO_RESULTS) {
+        acumulados = acumulados.concat(results || []);
+      }
+
+      const hayMas = pagination?.hasNextPage && pagina < MAX_PAG;
+
+      if (!hayMas) {
+        /* Terminamos — todas las páginas o sin más resultados */
+        clearTimeout(timeoutGral);
+        resolve(acumulados);
+        return;
+      }
+
+      /* Hay más páginas — esperar y pedir la siguiente */
+      pagina++;
+      setTimeout(() => {
+        try {
+          /*
+           * nextPage() llama a procesarPagina de nuevo.
+           * El callback sigue vivo porque vive en el closure,
+           * no dentro de una Promise que ya resolvió.
+           */
+          pagination.nextPage(procesarPagina);
+        } catch(e) {
+          console.warn('[Pag] nextPage() falló:', e.message);
+          clearTimeout(timeoutGral);
+          resolve(acumulados);
+        }
+      }, DELAY_PAG_MS);
+    }
+
+    /* Lanzar página 1 — el mismo callback maneja todas las páginas */
     service.textSearch(
       { query: `${rubro} ${ciudad}`, location, radius: 15000 },
-      (results, status, pagination) => {
-        const S = google.maps.places.PlacesServiceStatus;
-        if (status === S.OK || status === S.ZERO_RESULTS) {
-          resolve({ results: results || [], pagination });
-        } else {
-          reject(new Error('Google Places: ' + status));
-        }
-      }
+      procesarPagina
     );
   });
 
-  /* Guardar pagination para cargar más en background después de render */
-  buscarGoogle._pagination    = places.pagination || null;
-  buscarGoogle._rubro         = rubro;
-  buscarGoogle._ciudad        = ciudad;
+  /* Guardar rubro/ciudad para referencia */
+  buscarGoogle._rubro  = rubro;
+  buscarGoogle._ciudad = ciudad;
 
-  /* Mapear resultados base — telefono vacío por ahora */
-  const resultados = places.results.map((r, i) => ({
+  /* Mapear y devolver */
+  return todosLosResultados.map((r, i) => ({
     nombre:    r.name,
     direccion: r.formatted_address || '',
-    telefono:  '',    /* ← se llena en enriquecerConTelefonos() */
+    telefono:  '',
     web:       '',
     lat:       r.geometry?.location?.lat() ?? null,
     lon:       r.geometry?.location?.lng() ?? null,
@@ -1879,249 +1926,8 @@ async function buscarGoogle(ciudad, rubro) {
     fuente:    'google',
     googleId:  r.place_id,
     rating:    r.rating || 0,
-    _idx:      i       /* índice para referencia en actualizarCardTelefono */
+    _idx:      i
   }));
-
-  /* Aplicar cache inmediato para los que ya tenemos detalles */
-  resultados.forEach(r => {
-    if (r.googleId && _detailsCache.has(r.googleId)) {
-      const c    = _detailsCache.get(r.googleId);
-      r.telefono = c.telefono;
-      r.web      = c.web;
-    }
-  });
-
-  return resultados;
-}
-
-/* ── Lanzar enriquecimiento DESPUÉS de renderizar ─────────────────── */
-/*
-   Se llama desde el handler de búsqueda, DESPUÉS de renderResultados(),
-   para que las cards ya estén en el DOM cuando llegan los teléfonos.
-*/
-/*
- * Carga páginas 2 y 3 de Google en background, DESPUÉS de que la
- * página 1 ya está renderizada y visible para el usuario.
- *
- * nextPage() reutiliza el callback original de textSearch().
- * La única forma de usarlo correctamente es con un callback estilo
- * Node — no con Promise directa.
- */
-async function cargarPaginasExtra(resultadosBase) {
-  /*
-   * PAGINACIÓN DEFINITIVA — Google Places JS API.
-   *
-   * La API de paginación funciona así:
-   *   1. textSearch(req, cb) → cb recibe (results, status, pagination)
-   *   2. pagination.nextPage() → llama al MISMO cb con los siguientes resultados
-   *
-   * El truco: NO convertir el cb en Promise todavía cuando llamamos textSearch.
-   * En su lugar, el cb guarda una referencia al pagination y resuelve
-   * promises dinámicamente. Así nextPage() funciona porque el cb sigue vivo.
-   *
-   * 30-40 resultados en vez de 60 pasaba porque:
-   *   - Extraíamos el token y hacíamos una nueva textSearch con query diferente
-   *   - Google a veces rechaza el token si el query no es IDÉNTICO al original
-   *   - El token >100 chars no siempre está en las propiedades del objeto
-   */
-  const service = getPlacesService();
-  const S       = google.maps.places.PlacesServiceStatus;
-  const info    = $('#buscar-info');
-  const rubro   = buscarGoogle._rubro;
-  const ciudad  = buscarGoogle._ciudad;
-
-  /* pagination guardado de la página 1 */
-  let paginaActual = buscarGoogle._pagination;
-  if (!paginaActual?.hasNextPage) return;
-
-  let pagNum    = 2;
-  const MAX_PAG = 3;
-
-  while (paginaActual?.hasNextPage && pagNum <= MAX_PAG) {
-
-    /* Google exige mínimo 2s entre páginas para activar el token */
-    await new Promise(res => setTimeout(res, 2500));
-
-    /* Capturar resultados de nextPage() con callback registrado en closure */
-    const nuevos = await new Promise(resolve => {
-      const tid = setTimeout(() => {
-        console.warn('[Pag] Timeout página', pagNum);
-        resolve([]);
-      }, 20000);
-
-      /*
-       * nextPage() reutiliza internamente el callback de textSearch.
-       * Para interceptarlo, hacemos una nueva llamada a textSearch
-       * usando el MISMO service, con el mismo query, y dejamos que
-       * Google use el token interno que ya tiene en paginaActual.
-       *
-       * La forma correcta documentada por Google:
-       * https://developers.google.com/maps/documentation/javascript/places#place_search_responses
-       *
-       * pagination.nextPage() dispara una nueva request y llama al
-       * callback que se pase a nextPage() — SÍ acepta callback desde
-       * la versión 3.54+ del SDK. Versiones anteriores no lo aceptan.
-       * Detectamos cuál tenemos:
-       */
-      try {
-        const result = paginaActual.nextPage(function(results, status, nextPag) {
-          clearTimeout(tid);
-          if (status === S.OK || status === S.ZERO_RESULTS) {
-            paginaActual = (nextPag?.hasNextPage) ? nextPag : null;
-            resolve(results || []);
-          } else {
-            console.warn('[Pag] Status página', pagNum, ':', status);
-            paginaActual = null;
-            resolve([]);
-          }
-        });
-
-        /*
-         * Si nextPage() retorna undefined/null → acepta callback (v3.54+) ✓
-         * Si nextPage() retorna algo truthy → es la versión vieja que
-         * no acepta callback. En ese caso el callback nunca se llama
-         * y el timeout va a resolver con [].
-         * Para la versión vieja, usar textSearch directo con token extraído.
-         */
-        if (result !== undefined && result !== null) {
-          /* Versión vieja de SDK — intentar con token extraído */
-          clearTimeout(tid);
-          const token = Object.entries(paginaActual)
-            .filter(([k,v]) => typeof v === 'string' && v.length > 50 && v.length < 400)
-            .sort((a,b) => b[1].length - a[1].length)[0]?.[1] || null;
-
-          if (token) {
-            const tmpDiv = document.createElement('div');
-            const tmpSvc = new google.maps.places.PlacesService(tmpDiv);
-            tmpSvc.textSearch(
-              { query: `${rubro} ${ciudad}`, pageToken: token },
-              (res2, st2, pag2) => {
-                if (st2 === S.OK || st2 === S.ZERO_RESULTS) {
-                  paginaActual = pag2?.hasNextPage ? pag2 : null;
-                  resolve(res2 || []);
-                } else {
-                  paginaActual = null;
-                  resolve([]);
-                }
-              }
-            );
-          } else {
-            paginaActual = null;
-            resolve([]);
-          }
-        }
-      } catch(e) {
-        clearTimeout(tid);
-        console.warn('[Pag] Error página', pagNum, e.message);
-        paginaActual = null;
-        resolve([]);
-      }
-    });
-
-    if (!nuevos.length) break;
-
-    /* Deduplicar */
-    const idsExistentes = new Set(resultadosBase.map(r => r.googleId).filter(Boolean));
-    const mapeados = nuevos
-      .filter(r => r.place_id && !idsExistentes.has(r.place_id))
-      .map((r, i) => ({
-        nombre:    r.name,
-        direccion: r.formatted_address || '',
-        telefono:  '',
-        web:       '',
-        lat:       r.geometry?.location?.lat() ?? null,
-        lon:       r.geometry?.location?.lng() ?? null,
-        tipo:      (r.types || [])[0] || '',
-        rubro:     detectarRubro((r.types || [])[0] || ''),
-        fuente:    'google',
-        googleId:  r.place_id,
-        rating:    r.rating || 0,
-        _idx:      resultadosBase.length + i
-      }));
-
-    if (!mapeados.length) { pagNum++; continue; }
-
-    /* Cache de teléfonos existentes */
-    mapeados.forEach(r => {
-      if (r.googleId && _detailsCache.has(r.googleId)) {
-        const c = _detailsCache.get(r.googleId);
-        r.telefono = c.telefono;
-        r.web      = c.web;
-      }
-    });
-
-    /* Agregar a state */
-    state.resultados = state.resultados.concat(mapeados);
-    mapeados.forEach(r => resultadosBase.push(r));
-
-    /* Renderizar cards nuevas en el DOM */
-    const cont = $('#resultados-buscar');
-    mapeados.forEach(n => {
-      const tel    = !!(n.telefono && limpiarTel(n.telefono).length >= 6);
-      const yaLead = !!encontrarLeadExistente(n);
-      const iut    = calcularIUT({ ...n, equipos: [], tags: [] });
-      n.iut = iut;
-
-      const div = document.createElement('div');
-      div.className = 'result-card src-g';
-      if (n.googleId) div.dataset.googleId = n.googleId;
-
-      const telHtml = tel
-        ? `<div class="rc-meta rc-tel-slot">📞 <strong>${esc(n.telefono)}</strong></div>`
-        : `<div class="rc-meta rc-tel-slot muted"><span class="spinner" style="width:10px;height:10px;border-width:1px;vertical-align:middle;margin-right:4px;"></span>Cargando...</div>`;
-
-      div.innerHTML = `
-        <div class="rc-header">
-          <div class="rc-name">${esc(n.nombre)} <span class="iut-badge ${iutClase(iut)}" style="font-size:9px;">${iutLabel(iut)}${iut}</span></div>
-          ${n.rating ? `<div style="color:var(--yellow);font-size:11px;">★ ${n.rating}</div>` : ''}
-        </div>
-        ${n.direccion ? `<div class="rc-meta">📍 ${esc(n.direccion)}</div>` : ''}
-        ${telHtml}
-        <div class="rc-actions">
-          <button class="btn btn-sm btn-maps">MAPS</button>
-          ${tel ? `<button class="btn btn-sm btn-b rc-wa-btn btn-wa">WA</button>` : ''}
-          <button class="btn btn-sm ${yaLead?'':'btn-em'} btn-add" ${yaLead?'disabled style="opacity:0.5;"':''}>
-            ${yaLead ? '✓ GUARDADO' : '+ GUARDAR'}
-          </button>
-        </div>`;
-
-      div.querySelector('.btn-maps').addEventListener('click', () => abrirMaps(n));
-      div.querySelector('.btn-add').addEventListener('click', async ev => {
-        if (encontrarLeadExistente(n)) return;
-        const lead = crearLeadDesdeResultado(n);
-        await dbSaveLead(lead);
-        if (lead.lat && lead.lon && state.mapLeadsVisible) {
-          const m = L.marker([lead.lat,lead.lon],{icon:createLeadIcon(lead)})
-            .addTo(map).on('click',()=>{expandPanel();setTab('leads');setTimeout(()=>abrirModalLead(lead.id),200);});
-          _leadMarkersMap.set(lead.id, m);
-        }
-        ev.target.textContent='✓ GUARDADO';
-        ev.target.disabled=true;
-        ev.target.classList.remove('btn-em');
-        toast('✓ Lead guardado');
-      });
-      div.querySelector('.btn-wa')?.addEventListener('click', async () => {
-        let lead = encontrarLeadExistente(n);
-        if (!lead) { lead = crearLeadDesdeResultado(n); await dbSaveLead(lead); }
-        abrirWhatsApp(lead, 'primero');
-      });
-
-      cont.appendChild(div);
-    });
-
-    /* Markers */
-    renderMapResults(state.resultados);
-
-    /* Contador */
-    if (info) info.textContent = `${state.resultados.length} objetivo(s) encontrado(s)`;
-
-    /* Teléfonos en background */
-    lanzarEnriquecimiento(mapeados);
-
-    pagNum++;
-  }
-
-  buscarGoogle._pagination = null;
 }
 async function lanzarEnriquecimiento(resultados) {
   const conGoogleId = resultados.filter(r => r.fuente === 'google' && r.googleId);
@@ -2205,8 +2011,6 @@ $('#btn-buscar').addEventListener('click', async () => {
   /* Enriquecer con teléfonos DESPUÉS de que las cards estén en el DOM */
   if (resultados.some(r => r.fuente === 'google')) {
     lanzarEnriquecimiento(resultados);
-    /* Cargar páginas 2 y 3 en background sin bloquear la UI */
-    cargarPaginasExtra(resultados);
   }
 
   $('#btn-buscar').disabled = false;
